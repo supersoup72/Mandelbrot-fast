@@ -1,14 +1,13 @@
-CC      = gcc
-CFLAGS  = -O3 -march=native -funroll-loops -ffast-math -fopenmp -Wall -Wextra -Wno-unused-result
-LIBS    = -lm -fopenmp
-TARGET  = mandelbrot
+CC     = gcc
+CFLAGS = -O3 -march=native -funroll-loops -ffast-math -fopenmp -mavx2 -mfma -Wall -Wextra -Wno-unused-result
+LIBS   = -lm -fopenmp
 
 .PHONY: all clean
 
-all: $(TARGET)
+all: mandelbrot
 
-$(TARGET): mandelbrot.c
-	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
+mandelbrot: mandelbrot.c orbit.c orbit.h
+	$(CC) $(CFLAGS) -o $@ mandelbrot.c orbit.c $(LIBS)
 
 clean:
-	rm -f $(TARGET)
+	rm -f mandelbrot
