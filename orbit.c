@@ -93,10 +93,20 @@ Orbit *orbit_new(double cx, double cy, int max_iter, double max_delta)
 
         cx_t two_Zk = cx_scale(o->Z[k], 2.0);
 
-        /* validity: |C_k| * max_delta^2 < 1e-6 * |A_k| */
+        /* Validity requires the truncated quadratic AND cubic terms to be
+         * negligible next to the retained linear term:
+         *   |B_k| * max_delta     < tol * |A_k|   (quadratic term tiny)
+         *   |C_k| * max_delta^2   < tol * |A_k|   (cubic term tiny)
+         * Checking only the cubic term (as a single coefficient ratio) is
+         * not sufficient: C_k can be coincidentally ~0 early on (e.g. an
+         * artifact of Z_0=0) while B_k*Δc is still comparable to A_k*Δc,
+         * meaning the series has NOT actually converged — this produced
+         * widespread wrong iteration counts at low zoom (large Δc) where
+         * the 2-term truncation is simply invalid.                       */
+        double absB = sqrt(cx_abs2(Bn));
         double absC = sqrt(cx_abs2(Cn));
         double absA = sqrt(cx_abs2(An));
-        if (absC * md2 < 1e-6 * absA) {
+        if (absB * max_delta < 1e-3 * absA && absC * md2 < 1e-3 * absA) {
             o->sa_skip = k;
         }
 
@@ -245,6 +255,45 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
     }
     for (int x = 0; x < w; x++) iter_count[x] = -1; /* sentinel = not done */
 
+    /* The SA seed jumps straight to n = sa_n without validating any
+     * intermediate iteration in between — the validity criterion only
+     * bounds polynomial truncation error, not whether an escape happens
+     * somewhere in [1, sa_n). δ_1 = Δc exactly (Z_0 = 0), so checking n=1
+     * is free (no polynomial evaluation) and catches the single most
+     * common "escapes immediately" case (|c| > 2) cheaply.               */
+    if (sa_n > 1) {
+        int idx1 = (1 < o->len) ? 1 : (o->len < max_iter ? o->len : o->len - 1);
+        double Znr = o->Z[idx1].r, Zni = o->Z[idx1].i;
+        for (int x = 0; x < w; x++) {
+            double Wr = Znr + dcr[x];
+            double Wi = Zni + dci[x];
+            if (Wr*Wr + Wi*Wi > 4.0) iter_count[x] = 1;
+        }
+    }
+
+    /* A pixel can also already be escaped (or glitched) exactly AT the
+     * seeded point n = sa_n — if that isn't checked here, the loops below
+     * would iterate one step further before noticing, reporting an
+     * escape iteration one too high.                                     */
+    {
+        int idx = (sa_n < o->len) ? sa_n
+                : (o->len < max_iter ? o->len : o->len - 1);
+        double Znr = o->Z[idx].r, Zni = o->Z[idx].i;
+        double Zmag2 = Znr*Znr + Zni*Zni;
+        for (int x = 0; x < w; x++) {
+            if (iter_count[x] >= 0) continue;
+            double Wr = Znr + dr[x];
+            double Wi = Zni + di[x];
+            double W2 = Wr*Wr + Wi*Wi;
+            if (W2 > 4.0) {
+                iter_count[x] = sa_n;
+            } else if (W2 < GLITCH_EPS2 * Zmag2) {
+                glitched[x]   = 1;
+                iter_count[x] = max_iter; /* placeholder; overridden later */
+            }
+        }
+    }
+
     /* Compute max |δ|² across active pixels for BLA validity check */
     while (n < o->len && o->bla_levels > 0) {
         /* find best BLA level where all active pixels are valid */
@@ -287,8 +336,14 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
         n += step;
 
         /* After applying BLA step, check escape at new position n.
-         * Use Z[n] if available, else Z[len-1].                         */
-        int Zn_idx = (n < o->len) ? n : o->len - 1;
+         * Use Z[n] if available. If n lands exactly at the end of the
+         * recorded orbit and the reference itself escaped (o->len <
+         * max_iter), Z[o->len] still holds that valid escaped value —
+         * use it instead of stale Z[len-1], which corrupts W = Z+δ and
+         * causes widespread wrong escape iterations near the orbit's
+         * own escape point (the single most common perturbation glitch). */
+        int Zn_idx = (n < o->len) ? n
+                   : (o->len < max_iter ? o->len : o->len - 1);
         double Znr = o->Z[Zn_idx].r, Zni = o->Z[Zn_idx].i;
         double Zmag2 = Znr*Znr + Zni*Zni;
         for (int x = 0; x < w; x++) {
@@ -372,8 +427,12 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
                                vDci);
 
             /* Escape check: |Z_{nn+1} + δ_{nn+1}|² > 4
-             * Z_{nn+1} is Z[nn+1] if available                          */
-            int next_idx = (nn + 1 < o->len) ? nn + 1 : o->len - 1;
+             * Z_{nn+1} is Z[nn+1] if available; if nn+1 lands exactly at
+             * the recorded orbit's end and the reference escaped early
+             * (o->len < max_iter), Z[o->len] is still the valid escaped
+             * value and must be used instead of stale Z[len-1].         */
+            int next_idx = (nn + 1 < o->len) ? nn + 1
+                          : (o->len < max_iter ? o->len : o->len - 1);
             double Zr1 = o->Z[next_idx].r, Zi1 = o->Z[next_idx].i;
             __m256d vZr1 = _mm256_set1_pd(Zr1);
             __m256d vZi1 = _mm256_set1_pd(Zi1);
@@ -418,8 +477,20 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
         /* Write results */
         for (int k = 0; k < 4; k++) {
             if (iter_count[x+k] < 0) {
-                /* Still active after orbit exhausted → inside set */
-                iter_count[x+k] = active_mask[k] ? max_iter : cnt[k];
+                if (!active_mask[k]) {
+                    iter_count[x+k] = cnt[k];
+                } else if (o->len >= max_iter) {
+                    /* Reference orbit ran the full max_iter without
+                     * escaping: a still-active pixel is genuinely inside. */
+                    iter_count[x+k] = max_iter;
+                } else {
+                    /* Reference orbit escaped before max_iter and ran out
+                     * of data while this pixel was still unresolved — its
+                     * true fate is unknown to perturbation; verify directly
+                     * rather than assuming it's inside the set.            */
+                    glitched[x+k]   = 1;
+                    iter_count[x+k] = max_iter; /* placeholder; overridden later */
+                }
             }
         }
     }
@@ -438,7 +509,8 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
             double ndr  = 2.0*(Znr*pdr - Zni*pdi) + dr2 + dcr[x];
             double ndi  = 2.0*(Znr*pdi + Zni*pdr) + di2 + dci[x];
             pdr = ndr; pdi = ndi;
-            int ni = (nn+1 < o->len) ? nn+1 : o->len-1;
+            int ni = (nn+1 < o->len) ? nn+1
+                   : (o->len < max_iter ? o->len : o->len-1);
             double Zr1 = o->Z[ni].r, Zi1 = o->Z[ni].i;
             double Wr = Zr1 + pdr;
             double Wi = Zi1 + pdi;
@@ -450,8 +522,17 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
         if (glitch) {
             glitched[x]   = 1;
             iter_count[x] = max_iter; /* placeholder; overridden later */
+        } else if (nn >= max_iter) {
+            /* nn can only reach max_iter if the reference orbit covered
+             * the full range (o->len >= max_iter), so the pixel is
+             * genuinely inside the set.                                */
+            iter_count[x] = max_iter;
         } else {
-            iter_count[x] = (nn >= max_iter) ? max_iter : nn;
+            /* Loop stopped because the reference orbit ran out of data
+             * (nn == o->len) before this pixel resolved — its true fate
+             * is unknown to perturbation; verify directly.             */
+            glitched[x]   = 1;
+            iter_count[x] = max_iter; /* placeholder; overridden later */
         }
     }
 
