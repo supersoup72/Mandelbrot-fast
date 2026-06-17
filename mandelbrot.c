@@ -3,7 +3,8 @@
  *  wasd    pan              z / x   zoom in / out
  *  i / o   more/fewer iter  k / l   color density up / down
  *  p       save PNG         t       toggle truecolor / 16-color
- *  M       zoom-out animation (prompts for per-frame zoom factor)
+ *  M       zoom-out animation: saves numbered PNG frames (prompts for
+ *          per-frame zoom factor); concat with ffmpeg afterwards
  *  q       quit
  *
  *  Rendering uses Unicode upper-half-block glyphs (▀) with independent
@@ -351,13 +352,15 @@ static void render(void) {
 
 /* ─── PNG export ────────────────────────────────────────────────────────── */
 
-static void save_png(void) {
+/* Renders the current view at oversampled resolution (target ~1920px
+ * wide, rather than just upscaling terminal cells) and writes it to
+ * `fname`. Returns 0 on success; pw_out / ph_out / ms_out receive the
+ * pixel dimensions used and the render time, for status messages.       */
+static int render_view_to_png(const char *fname, int *pw_out, int *ph_out, double *ms_out) {
     int W, h, ph;
     double sx, sy, x0, y0;
     view_geometry(&W, &h, &ph, &sx, &sy, &x0, &y0);
 
-    /* Oversample the same view bounds onto a higher-resolution grid
-     * (target ~1920 px wide) rather than just upscaling terminal cells. */
     int scale = 1920 / W;
     if (scale < 1) scale = 1;
     int pw  = W  * scale;
@@ -377,7 +380,7 @@ static void save_png(void) {
     Orbit *orb = get_orbit(g_cx, g_cy, mi, max_delta);
 
     unsigned char *rgb = malloc((size_t)pw * phh * 3);
-    if (!rgb) { snprintf(g_msg, sizeof g_msg, "png save failed: out of memory"); return; }
+    if (!rgb) return -1;
 
     #pragma omp parallel for schedule(dynamic, 2)
     for (int y = 0; y < phh; y++) {
@@ -410,8 +413,16 @@ static void save_png(void) {
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
 
+    int ok = write_png(fname, pw, phh, rgb) == 0;
+    free(rgb);
+
+    *pw_out = pw; *ph_out = phh;
+    *ms_out = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    return ok ? 0 : -1;
+}
+
+static void save_png(void) {
     /* Sequence number guards against collisions when multiple exports
      * land within the same wall-clock second (timestamp alone isn't
      * unique enough since a render can finish in single-digit ms).    */
@@ -422,22 +433,28 @@ static void save_png(void) {
     char fname[64];
     snprintf(fname, sizeof fname, "mandelbrot_%s_%03d.png", stamp, seq++);
 
-    int ok = write_png(fname, pw, phh, rgb) == 0;
-    free(rgb);
+    int pw, ph;
+    double ms;
+    int ok = render_view_to_png(fname, &pw, &ph, &ms) == 0;
 
     if (ok)
-        snprintf(g_msg, sizeof g_msg, "saved %s (%dx%d, %.0fms)", fname, pw, phh, ms);
+        snprintf(g_msg, sizeof g_msg, "saved %s (%dx%d, %.0fms)", fname, pw, ph, ms);
     else
         snprintf(g_msg, sizeof g_msg, "png save failed: %s", fname);
 }
 
 /* ─── zoom-out animation ─────────────────────────────────────────────────
- * 'M' plays a live zoom-out animation from the current zoom level down to
- * 1.0 ("e0"), dividing g_zoom by a user-chosen per-frame factor each step
- * (e.g. 1.085 for a slow, smooth descent). Since the center (cx, cy) and
- * iteration count stay fixed throughout, every frame hits the orbit cache
- * in get_orbit() — only the cheap orbit_select() rescan runs per frame,
- * not a full reference-orbit/BLA rebuild.                                 */
+ * 'M' saves a numbered sequence of PNG frames zooming out from the
+ * current zoom level down to 1.0 ("e0"), dividing g_zoom by a user-chosen
+ * per-frame factor each step (e.g. 1.085 for a slow, smooth descent) —
+ * meant to be concatenated into a video afterwards, e.g.:
+ *   ffmpeg -framerate 30 -i mandelbrot_anim_<stamp>_%05d.png \
+ *          -c:v libx264 -pix_fmt yuv420p out.mp4
+ * A cheap terminal preview is also drawn each frame so progress is
+ * visible live. Since the center (cx, cy) and iteration count stay fixed
+ * throughout, every frame hits the orbit cache in get_orbit() — only the
+ * cheap orbit_select() rescan runs per frame, not a full
+ * reference-orbit/BLA rebuild.                                            */
 
 static void draw_status_line(const char *text) {
     int W, H;
@@ -479,9 +496,29 @@ static int prompt_zoom_factor(double *out) {
 static void play_zoom_out(double factor, int *quit) {
     *quit = 0;
     int aborted = 0;
-    while (g_zoom > 1.0) {
-        g_zoom /= factor;
-        if (g_zoom < 1.0) g_zoom = 1.0;
+
+    char prefix[48];
+    time_t now = time(NULL);
+    char stamp[32];
+    strftime(stamp, sizeof stamp, "%Y%m%d_%H%M%S", localtime(&now));
+    snprintf(prefix, sizeof prefix, "mandelbrot_anim_%s", stamp);
+
+    int frame = 0;
+    for (;;) {
+        frame++;
+        char fname[80];
+        snprintf(fname, sizeof fname, "%s_%05d.png", prefix, frame);
+
+        int pw = 0, ph = 0;
+        double ms = 0.0;
+        int ok = render_view_to_png(fname, &pw, &ph, &ms) == 0;
+
+        if (ok)
+            snprintf(g_msg, sizeof g_msg, "saving frame %d (zoom=%.4g, %dx%d, %.0fms): %s",
+                     frame, g_zoom, pw, ph, ms, fname);
+        else
+            snprintf(g_msg, sizeof g_msg, "frame %d save FAILED (zoom=%.4g): %s",
+                     frame, g_zoom, fname);
         render();
 
         struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
@@ -493,9 +530,18 @@ static void play_zoom_out(double factor, int *quit) {
                 break;
             }
         }
+
+        if (g_zoom <= 1.0) break;
+        g_zoom /= factor;
+        if (g_zoom < 1.0) g_zoom = 1.0;
     }
-    snprintf(g_msg, sizeof g_msg, *quit ? "animation interrupted" :
-             aborted ? "animation aborted" : "animation complete (zoom=1)");
+
+    if (*quit)
+        snprintf(g_msg, sizeof g_msg, "saved %d frames (interrupted): %s_%%05d.png", frame, prefix);
+    else if (aborted)
+        snprintf(g_msg, sizeof g_msg, "saved %d frames (aborted): %s_%%05d.png", frame, prefix);
+    else
+        snprintf(g_msg, sizeof g_msg, "saved %d frames: %s_%%05d.png", frame, prefix);
 }
 
 /* ─── main ──────────────────────────────────────────────────────────────── */
