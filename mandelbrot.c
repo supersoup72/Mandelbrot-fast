@@ -677,7 +677,11 @@ int main(void) {
             break;
 
         case 'i': case 'I':
-            g_iter = g_iter < 4096 ? g_iter * 3 / 2 + 1 : g_iter;
+            /* No perceptible cap — this can grow as far as a deep zoom
+             * needs. The ceiling here only guards against signed overflow
+             * on repeated presses; rendering would be impractically slow
+             * long before it's reached.                                  */
+            g_iter = g_iter < 100000000 ? g_iter * 3 / 2 + 1 : g_iter;
             need_iet = 1; break;
         case 'o': case 'O':
             g_iter = g_iter > 8 ? g_iter * 2 / 3 : g_iter;
