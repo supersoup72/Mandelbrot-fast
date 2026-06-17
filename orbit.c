@@ -28,7 +28,7 @@ static inline cx_t cx_scale(cx_t a, double s) {
  * relative to the reference's own scale signals catastrophic cancellation:
  * δ_n has grown large enough that the linear perturbation model is no
  * longer trustworthy and the pixel orbit may have drifted onto the wrong
- * branch. Flagged pixels are recomputed directly (see scalar_mandelbrot). */
+ * branch. Flagged pixels are recomputed directly (see scalar_mandelbrot_dd). */
 #define GLITCH_EPS2 1e-12   /* (1e-6)^2 */
 
 /* Below this many elements, OpenMP's thread spawn/join overhead exceeds
@@ -37,24 +37,75 @@ static inline cx_t cx_scale(cx_t a, double s) {
  * to run serially via the `if()` clause rather than forking threads.    */
 #define OMP_PAR_THRESHOLD 20000
 
-/* ─── direct (non-perturbed) scalar Mandelbrot, for fallback/glitch fix ──── */
+/* ─── double-double Mandelbrot, for glitch/short-orbit fallback at deep zoom ──
+ * See dd_two_sum() in orbit.h for why this is needed: the fallback paths
+ * below only have a plain-double reference coordinate plus a plain-double
+ * delta, and once the delta is near or below the reference's ULP, "cr+ci"
+ * style direct iteration in double quantizes many distinct deltas onto the
+ * same double, producing flat wrong-colored rectangles. Splitting the sum
+ * into a double-double pair (exact, via dd_two_sum) and iterating with
+ * double-double arithmetic keeps ~106 bits of precision instead of 53.
+ *
+ * The whole block below is wrapped to disable -ffast-math: it relies on
+ * the *exact* IEEE rounding error of each + and - (that's the entire
+ * double-double technique), and -ffast-math's -fassociative-math is free
+ * to reassociate/cancel that error term back to zero, which it does in
+ * practice — silently turning every dd_t into a plain double again.      */
+#pragma GCC push_options
+#pragma GCC optimize ("no-fast-math")
 
-static int scalar_mandelbrot(double cr, double ci, int max_iter)
+static inline dd_t dd_add(dd_t a, dd_t b) {
+    double s   = a.hi + b.hi;
+    double bb  = s - a.hi;
+    double err = (a.hi - (s - bb)) + (b.hi - bb) + a.lo + b.lo;
+    double hi  = s + err;
+    double lo  = err - (hi - s);
+    return (dd_t){ hi, lo };
+}
+
+static inline dd_t dd_neg(dd_t a) { return (dd_t){ -a.hi, -a.lo }; }
+static inline dd_t dd_sub(dd_t a, dd_t b) { return dd_add(a, dd_neg(b)); }
+
+static inline dd_t dd_mul(dd_t a, dd_t b) {
+    double p   = a.hi * b.hi;
+    double e   = fma(a.hi, b.hi, -p);
+    e += a.hi*b.lo + a.lo*b.hi;
+    double hi  = p + e;
+    double lo  = e - (hi - p);
+    return (dd_t){ hi, lo };
+}
+
+int scalar_mandelbrot_dd(dd_t cr, dd_t ci, int max_iter)
 {
-    double p = cr - 0.25;
-    double q = p*p + ci*ci;
-    if (q*(q+p) <= 0.25*ci*ci || (cr+1.0)*(cr+1.0)+ci*ci <= 0.0625)
+    /* Cardioid/bulb quick-reject only needs O(1) precision (the test
+     * thresholds are 0.0625/0.25), so the .lo components are irrelevant
+     * here — using .hi alone is safe and avoids dd_mul overhead for the
+     * common case of points deep inside the main set.                  */
+    double p = cr.hi - 0.25;
+    double q = p*p + ci.hi*ci.hi;
+    if (q*(q+p) <= 0.25*ci.hi*ci.hi || (cr.hi+1.0)*(cr.hi+1.0)+ci.hi*ci.hi <= 0.0625)
         return max_iter;
-    double zr=0, zi=0, zr2=0, zi2=0;
-    int iter=0;
-    while (zr2+zi2 < 4.0 && iter < max_iter) {
-        zi  = 2.0*zr*zi + ci;
-        zr  = zr2-zi2+cr;
-        zr2 = zr*zr; zi2 = zi*zi;
+
+    dd_t zr = {0,0}, zi = {0,0};
+    int iter = 0;
+    while (iter < max_iter) {
+        dd_t zr2 = dd_mul(zr, zr);
+        dd_t zi2 = dd_mul(zi, zi);
+        /* Escape test only needs the hi part: once |z| actually exceeds
+         * 2, it diverges within a couple more steps regardless of the
+         * ~1e-32 correction in .lo, so the boundary itself doesn't need
+         * double-double precision — only the orbit leading up to it does. */
+        if (zr2.hi + zi2.hi >= 4.0) break;
+        dd_t zrzi  = dd_mul(zr, zi);
+        dd_t new_zi = dd_add(dd_add(zrzi, zrzi), ci);
+        dd_t new_zr = dd_add(dd_sub(zr2, zi2), cr);
+        zr = new_zr; zi = new_zi;
         iter++;
     }
     return iter;
 }
+
+#pragma GCC pop_options
 
 /* ─── reference orbit ────────────────────────────────────────────────────── */
 
@@ -224,8 +275,11 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
     /* If reference orbit is very short (reference escapes almost
      * immediately), perturbation has nothing useful to skip — go direct. */
     if (o->len < 2) {
-        for (int x = 0; x < w; x++)
-            out[x] = scalar_mandelbrot(o->cx + dcr[x], o->cy + dci[x], max_iter);
+        for (int x = 0; x < w; x++) {
+            dd_t cr = dd_two_sum(o->cx, dcr[x]);
+            dd_t ci = dd_two_sum(o->cy, dci[x]);
+            out[x]  = scalar_mandelbrot_dd(cr, ci, max_iter);
+        }
         return;
     }
 
@@ -600,7 +654,9 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
     /* Copy results to output, recomputing glitched pixels directly */
     for (int xx = 0; xx < w; xx++) {
         if (glitched[xx]) {
-            out[xx] = scalar_mandelbrot(o->cx + dcr[xx], o->cy + dci[xx], max_iter);
+            dd_t cr = dd_two_sum(o->cx, dcr[xx]);
+            dd_t ci = dd_two_sum(o->cy, dci[xx]);
+            out[xx] = scalar_mandelbrot_dd(cr, ci, max_iter);
         } else {
             out[xx] = (iter_count[xx] < 0) ? max_iter : iter_count[xx];
         }

@@ -4,6 +4,39 @@
 
 typedef struct { double r, i; } cx_t;
 
+/* ─── double-double helper, for fallback paths needing an absolute coord ──
+ * Adding a tiny per-pixel delta to an O(1) absolute coordinate in plain
+ * double loses precision once the delta drops below the coordinate's own
+ * ULP (~1e-16 relative) — exactly the regime deep zoom puts us in. That
+ * loss doesn't shrink with zoom, so it quantizes nearby pixels onto the
+ * same few representable doubles, which is what shows up as flat blocky
+ * rectangles. two_sum recovers the *exact* mathematical sum of two
+ * doubles as a (hi, lo) pair — no approximation, just split across two
+ * doubles instead of rounding into one — giving ~106 bits of headroom for
+ * the handful of pixels that actually need a direct (non-perturbed)
+ * absolute-coordinate iteration.                                          */
+typedef struct { double hi, lo; } dd_t;
+
+/* -ffast-math's -fassociative-math will happily "simplify" this exact
+ * error-recovery arithmetic back to lo=0 (algebraically true for reals,
+ * false for IEEE doubles — which is the entire point), so it's compiled
+ * with fast-math explicitly off regardless of the including TU's flags. */
+#pragma GCC push_options
+#pragma GCC optimize ("no-fast-math")
+static inline dd_t dd_two_sum(double a, double b) {
+    double s   = a + b;
+    double bb  = s - a;
+    double err = (a - (s - bb)) + (b - bb);
+    return (dd_t){ s, err };
+}
+#pragma GCC pop_options
+
+/* Direct (non-perturbed) Mandelbrot iteration at double-double precision —
+ * the extended-precision counterpart to a plain scalar fallback, for the
+ * rare per-pixel recompute that needs to trust an absolute coordinate far
+ * past where a single double can represent it accurately.                */
+int scalar_mandelbrot_dd(dd_t cr, dd_t ci, int max_iter);
+
 /* BLA entry: δ_{n+step} ≈ A*δ + B*Δc, valid when |δ|² < r2 */
 typedef struct { cx_t A, B; double r2; } BlaEntry;
 

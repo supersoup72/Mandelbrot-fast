@@ -142,21 +142,15 @@ static Orbit *get_orbit(double cx, double cy, int mi, double max_delta) {
 }
 
 /* ─── scalar fallback Mandelbrot (used only if orbit allocation fails) ──── */
+/* Uses double-double precision (scalar_mandelbrot_dd, from orbit.c) since
+ * this still has to add a per-pixel delta to an absolute coordinate, the
+ * same cancellation orbit_render_row()'s own fallback paths avoid — see
+ * dd_two_sum() in orbit.h.                                               */
 
-static int scalar_fallback(double cr, double ci, int max_iter) {
-    double p = cr - 0.25;
-    double q = p*p + ci*ci;
-    if (q*(q+p) <= 0.25*ci*ci || (cr+1.0)*(cr+1.0) + ci*ci <= 0.0625)
-        return max_iter;
-    double zr=0, zi=0, zr2=0, zi2=0;
-    int it=0;
-    while (zr2+zi2 < 4.0 && it < max_iter) {
-        zi  = 2.0*zr*zi + ci;
-        zr  = zr2-zi2 + cr;
-        zr2 = zr*zr; zi2 = zi*zi;
-        it++;
-    }
-    return it;
+static int scalar_fallback(double cx, double cy, double dcr, double dci, int max_iter) {
+    dd_t cr = dd_two_sum(cx, dcr);
+    dd_t ci = dd_two_sum(cy, dci);
+    return scalar_mandelbrot_dd(cr, ci, max_iter);
 }
 
 /* ─── continuous truecolor iteration→RGB table ──────────────────────────── */
@@ -297,8 +291,8 @@ static void render(void) {
             orbit_render_row(orb, dcr, dci_bot, W, mi, irow_bot);
         } else {
             for (int x = 0; x < W; x++) {
-                irow_top[x] = scalar_fallback(g_cx + dcr[x], g_cy + dci_top[x], mi);
-                irow_bot[x] = scalar_fallback(g_cx + dcr[x], g_cy + dci_bot[x], mi);
+                irow_top[x] = scalar_fallback(g_cx, g_cy, dcr[x], dci_top[x], mi);
+                irow_bot[x] = scalar_fallback(g_cx, g_cy, dcr[x], dci_bot[x], mi);
             }
         }
 
@@ -426,7 +420,7 @@ static int render_view_to_png(const char *fname, int png_level,
             orbit_render_row(orb, dcr, dci, pw, mi, irow);
         } else {
             for (int x = 0; x < pw; x++)
-                irow[x] = scalar_fallback(g_cx + dcr[x], g_cy + dci[x], mi);
+                irow[x] = scalar_fallback(g_cx, g_cy, dcr[x], dci[x], mi);
         }
 
         unsigned char *row = rgb + (size_t)y * pw * 3;
