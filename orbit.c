@@ -23,12 +23,42 @@ static inline cx_t cx_scale(cx_t a, double s) {
     return (cx_t){ a.r*s, a.i*s };
 }
 
+/* ─── glitch detection (Pauldelbrot criterion) ──────────────────────────────
+ * A perturbed point W = Z_n + δ_n that lands anomalously close to zero
+ * relative to the reference's own scale signals catastrophic cancellation:
+ * δ_n has grown large enough that the linear perturbation model is no
+ * longer trustworthy and the pixel orbit may have drifted onto the wrong
+ * branch. Flagged pixels are recomputed directly (see scalar_mandelbrot). */
+#define GLITCH_EPS2 1e-12   /* (1e-6)^2 */
+
+/* ─── direct (non-perturbed) scalar Mandelbrot, for fallback/glitch fix ──── */
+
+static int scalar_mandelbrot(double cr, double ci, int max_iter)
+{
+    double p = cr - 0.25;
+    double q = p*p + ci*ci;
+    if (q*(q+p) <= 0.25*ci*ci || (cr+1.0)*(cr+1.0)+ci*ci <= 0.0625)
+        return max_iter;
+    double zr=0, zi=0, zr2=0, zi2=0;
+    int iter=0;
+    while (zr2+zi2 < 4.0 && iter < max_iter) {
+        zi  = 2.0*zr*zi + ci;
+        zr  = zr2-zi2+cr;
+        zr2 = zr*zr; zi2 = zi*zi;
+        iter++;
+    }
+    return iter;
+}
+
 /* ─── reference orbit ────────────────────────────────────────────────────── */
 
 Orbit *orbit_new(double cx, double cy, int max_iter, double max_delta)
 {
     Orbit *o = calloc(1, sizeof *o);
     if (!o) return NULL;
+
+    o->cx = cx;
+    o->cy = cy;
 
     /* allocate with +2 spare */
     o->Z  = malloc((max_iter + 2) * sizeof *o->Z);
@@ -167,26 +197,11 @@ void orbit_free(Orbit *o)
 void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
                       int w, int max_iter, int *out)
 {
-    /* If reference orbit is very short, fall back to scalar perturbation.
-     * We start from δ=0 at n=0 and iterate the perturbation equation.  */
+    /* If reference orbit is very short (reference escapes almost
+     * immediately), perturbation has nothing useful to skip — go direct. */
     if (o->len < 2) {
-        for (int x = 0; x < w; x++) {
-            double pdr = 0.0, pdi = 0.0;
-            int nn;
-            for (nn = 0; nn < o->len && nn < max_iter; nn++) {
-                double Znr = o->Z[nn].r, Zni = o->Z[nn].i;
-                double dr2  = pdr*pdr - pdi*pdi;
-                double di2  = 2.0*pdr*pdi;
-                double ndr  = 2.0*(Znr*pdr - Zni*pdi) + dr2 + dcr[x];
-                double ndi  = 2.0*(Znr*pdi + Zni*pdr) + di2 + dci[x];
-                pdr = ndr; pdi = ndi;
-                int ni = (nn+1 < o->len) ? nn+1 : o->len-1;
-                double Wr = o->Z[ni].r + pdr;
-                double Wi = o->Z[ni].i + pdi;
-                if (Wr*Wr + Wi*Wi > 4.0) { nn++; break; }
-            }
-            out[x] = (nn >= max_iter) ? max_iter : nn;
-        }
+        for (int x = 0; x < w; x++)
+            out[x] = scalar_mandelbrot(o->cx + dcr[x], o->cy + dci[x], max_iter);
         return;
     }
 
@@ -223,8 +238,9 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
     int n = sa_n;
     /* iter_count[x] < 0 means pixel is still active (not yet escaped) */
     int  *iter_count = malloc(w * sizeof(int));
-    if (!iter_count) {
-        free(dr); free(di);
+    unsigned char *glitched = calloc(w, 1);
+    if (!iter_count || !glitched) {
+        free(dr); free(di); free(iter_count); free(glitched);
         return;
     }
     for (int x = 0; x < w; x++) iter_count[x] = -1; /* sentinel = not done */
@@ -274,12 +290,17 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
          * Use Z[n] if available, else Z[len-1].                         */
         int Zn_idx = (n < o->len) ? n : o->len - 1;
         double Znr = o->Z[Zn_idx].r, Zni = o->Z[Zn_idx].i;
+        double Zmag2 = Znr*Znr + Zni*Zni;
         for (int x = 0; x < w; x++) {
             if (iter_count[x] >= 0) continue;
             double Wr = Znr + dr[x];
             double Wi = Zni + di[x];
-            if (Wr*Wr + Wi*Wi > 4.0) {
+            double W2 = Wr*Wr + Wi*Wi;
+            if (W2 > 4.0) {
                 iter_count[x] = n;
+            } else if (W2 < GLITCH_EPS2 * Zmag2) {
+                glitched[x]   = 1;
+                iter_count[x] = max_iter;  /* placeholder; overridden later */
             }
         }
     }
@@ -364,6 +385,14 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
             __m256d esc_mask = _mm256_cmp_pd(W2, four, _CMP_GT_OQ);
             int     esc_bits = _mm256_movemask_pd(esc_mask);
 
+            /* glitch_mask: W anomalously small vs reference scale (catastrophic
+             * cancellation) AND did not escape this step                       */
+            double  Zmag2_next = Zr1*Zr1 + Zi1*Zi1;
+            __m256d gthresh    = _mm256_set1_pd(GLITCH_EPS2 * Zmag2_next);
+            __m256d raw_glitch = _mm256_cmp_pd(W2, gthresh, _CMP_LT_OQ);
+            __m256d glitch_mask = _mm256_andnot_pd(esc_mask, raw_glitch);
+            int     glitch_bits = _mm256_movemask_pd(glitch_mask);
+
             /* Freeze escaped lanes: keep old delta */
             new_dr = _mm256_blendv_pd(new_dr, vdr, esc_mask);
             new_di = _mm256_blendv_pd(new_di, vdi, esc_mask);
@@ -372,8 +401,13 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
 
             /* Record escape iteration for newly escaped lanes */
             for (int k = 0; k < 4; k++) {
-                if (active_mask[k] && (esc_bits & (1 << k))) {
+                if (!active_mask[k]) continue;
+                if (esc_bits & (1 << k)) {
                     cnt[k]         = nn + 1;
+                    active_mask[k] = 0;
+                } else if (glitch_bits & (1 << k)) {
+                    glitched[x+k]  = 1;
+                    cnt[k]         = max_iter; /* placeholder; overridden later */
                     active_mask[k] = 0;
                 }
             }
@@ -396,6 +430,7 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
 
         double pdr = dr[x], pdi = di[x];
         int nn;
+        int glitch = 0;
         for (nn = n; nn < o->len && nn < max_iter; nn++) {
             double Znr = o->Z[nn].r, Zni = o->Z[nn].i;
             double dr2  = pdr*pdr - pdi*pdi;
@@ -404,19 +439,33 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
             double ndi  = 2.0*(Znr*pdi + Zni*pdr) + di2 + dci[x];
             pdr = ndr; pdi = ndi;
             int ni = (nn+1 < o->len) ? nn+1 : o->len-1;
-            double Wr = o->Z[ni].r + pdr;
-            double Wi = o->Z[ni].i + pdi;
-            if (Wr*Wr + Wi*Wi > 4.0) { nn++; break; }
+            double Zr1 = o->Z[ni].r, Zi1 = o->Z[ni].i;
+            double Wr = Zr1 + pdr;
+            double Wi = Zi1 + pdi;
+            double W2 = Wr*Wr + Wi*Wi;
+            if (W2 > 4.0) { nn++; break; }
+            double Zmag2 = Zr1*Zr1 + Zi1*Zi1;
+            if (W2 < GLITCH_EPS2 * Zmag2) { glitch = 1; break; }
         }
-        iter_count[x] = (nn >= max_iter) ? max_iter : nn;
+        if (glitch) {
+            glitched[x]   = 1;
+            iter_count[x] = max_iter; /* placeholder; overridden later */
+        } else {
+            iter_count[x] = (nn >= max_iter) ? max_iter : nn;
+        }
     }
 
-    /* Copy results to output */
+    /* Copy results to output, recomputing glitched pixels directly */
     for (int xx = 0; xx < w; xx++) {
-        out[xx] = (iter_count[xx] < 0) ? max_iter : iter_count[xx];
+        if (glitched[xx]) {
+            out[xx] = scalar_mandelbrot(o->cx + dcr[xx], o->cy + dci[xx], max_iter);
+        } else {
+            out[xx] = (iter_count[xx] < 0) ? max_iter : iter_count[xx];
+        }
     }
 
     free(dr);
     free(di);
     free(iter_count);
+    free(glitched);
 }

@@ -142,9 +142,10 @@ static void render(void) {
     if (h < 1 || W < 1) return;
     ensure_bufs(W, h);
 
-    /* coordinate step sizes */
+    /* coordinate step sizes (terminal cells are ~2x taller than wide,
+     * so a column must cover half the coordinate distance a row does) */
     double sy = 2.5 / g_zoom / h;
-    double sx = sy * 2.0;
+    double sx = sy * 0.5;
     double x0 = g_cx - W * 0.5 * sx;
     double y0 = g_cy - h * 0.5 * sy;
 

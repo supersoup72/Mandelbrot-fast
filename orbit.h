@@ -10,6 +10,7 @@ typedef struct { cx_t A, B; double r2; } BlaEntry;
 #define BLA_LEVELS 12
 
 typedef struct {
+    double cx, cy;     /* reference point (absolute coordinates) */
     cx_t *Z;         /* reference orbit Z[0..len-1]          */
     cx_t *sA, *sB;   /* SA coefficients at each iteration     */
     int   len;        /* orbit length (including escape point) */
