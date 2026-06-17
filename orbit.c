@@ -28,7 +28,7 @@ static inline cx_t cx_scale(cx_t a, double s) {
  * relative to the reference's own scale signals catastrophic cancellation:
  * δ_n has grown large enough that the linear perturbation model is no
  * longer trustworthy and the pixel orbit may have drifted onto the wrong
- * branch. Flagged pixels are recomputed directly (see scalar_mandelbrot_dd). */
+ * branch. Flagged pixels are recomputed directly (see scalar_mandelbrot_mp). */
 #define GLITCH_EPS2 1e-12   /* (1e-6)^2 */
 
 /* Below this many elements, OpenMP's thread spawn/join overhead exceeds
@@ -37,85 +37,69 @@ static inline cx_t cx_scale(cx_t a, double s) {
  * to run serially via the `if()` clause rather than forking threads.    */
 #define OMP_PAR_THRESHOLD 20000
 
-/* ─── double-double Mandelbrot, for glitch/short-orbit fallback at deep zoom ──
- * See dd_two_sum() in orbit.h for why this is needed: the fallback paths
- * below only have a plain-double reference coordinate plus a plain-double
- * delta, and once the delta is near or below the reference's ULP, "cr+ci"
- * style direct iteration in double quantizes many distinct deltas onto the
- * same double, producing flat wrong-colored rectangles. Splitting the sum
- * into a double-double pair (exact, via dd_two_sum) and iterating with
- * double-double arithmetic keeps ~106 bits of precision instead of 53.
- *
- * The whole block below is wrapped to disable -ffast-math: it relies on
- * the *exact* IEEE rounding error of each + and - (that's the entire
- * double-double technique), and -ffast-math's -fassociative-math is free
- * to reassociate/cancel that error term back to zero, which it does in
- * practice — silently turning every dd_t into a plain double again.      */
-#pragma GCC push_options
-#pragma GCC optimize ("no-fast-math")
-
-static inline dd_t dd_add(dd_t a, dd_t b) {
-    double s   = a.hi + b.hi;
-    double bb  = s - a.hi;
-    double err = (a.hi - (s - bb)) + (b.hi - bb) + a.lo + b.lo;
-    double hi  = s + err;
-    double lo  = err - (hi - s);
-    return (dd_t){ hi, lo };
-}
-
-static inline dd_t dd_neg(dd_t a) { return (dd_t){ -a.hi, -a.lo }; }
-static inline dd_t dd_sub(dd_t a, dd_t b) { return dd_add(a, dd_neg(b)); }
-
-static inline dd_t dd_mul(dd_t a, dd_t b) {
-    double p   = a.hi * b.hi;
-    double e   = fma(a.hi, b.hi, -p);
-    e += a.hi*b.lo + a.lo*b.hi;
-    double hi  = p + e;
-    double lo  = e - (hi - p);
-    return (dd_t){ hi, lo };
-}
-
-int scalar_mandelbrot_dd(dd_t cr, dd_t ci, int max_iter)
+/* ─── MPFR Mandelbrot, for glitch/short-orbit fallback at any zoom depth ──
+ * The fallback paths below need to trust an absolute coordinate built
+ * from the reference center plus a per-pixel delta. At deep zoom the
+ * center itself needs more than 53 bits to even specify the location, so
+ * this iterates entirely in MPFR at whatever precision the orbit's own
+ * center was built with — there's no fixed bit budget to run out of, only
+ * a (rare, per-glitched-pixel) performance cost.                         */
+int scalar_mandelbrot_mp(const mpfr_t cr, const mpfr_t ci, int max_iter)
 {
-    /* Cardioid/bulb quick-reject only needs O(1) precision (the test
-     * thresholds are 0.0625/0.25), so the .lo components are irrelevant
-     * here — using .hi alone is safe and avoids dd_mul overhead for the
-     * common case of points deep inside the main set.                  */
-    double p = cr.hi - 0.25;
-    double q = p*p + ci.hi*ci.hi;
-    if (q*(q+p) <= 0.25*ci.hi*ci.hi || (cr.hi+1.0)*(cr.hi+1.0)+ci.hi*ci.hi <= 0.0625)
+    /* Cardioid/bulb quick-reject only needs O(1) precision, so a plain
+     * double snapshot of cr/ci is enough for this test.                 */
+    double crd = mpfr_get_d(cr, MPFR_RNDN);
+    double cid = mpfr_get_d(ci, MPFR_RNDN);
+    double p = crd - 0.25;
+    double q = p*p + cid*cid;
+    if (q*(q+p) <= 0.25*cid*cid || (crd+1.0)*(crd+1.0)+cid*cid <= 0.0625)
         return max_iter;
 
-    dd_t zr = {0,0}, zi = {0,0};
+    mpfr_prec_t prec = mpfr_get_prec(cr);
+    mpfr_t zr, zi, zr2, zi2, zrzi, tmp;
+    mpfr_inits2(prec, zr, zi, zr2, zi2, zrzi, tmp, (mpfr_ptr)0);
+    mpfr_set_zero(zr, 1);
+    mpfr_set_zero(zi, 1);
+
     int iter = 0;
     while (iter < max_iter) {
-        dd_t zr2 = dd_mul(zr, zr);
-        dd_t zi2 = dd_mul(zi, zi);
-        /* Escape test only needs the hi part: once |z| actually exceeds
-         * 2, it diverges within a couple more steps regardless of the
-         * ~1e-32 correction in .lo, so the boundary itself doesn't need
-         * double-double precision — only the orbit leading up to it does. */
-        if (zr2.hi + zi2.hi >= 4.0) break;
-        dd_t zrzi  = dd_mul(zr, zi);
-        dd_t new_zi = dd_add(dd_add(zrzi, zrzi), ci);
-        dd_t new_zr = dd_add(dd_sub(zr2, zi2), cr);
-        zr = new_zr; zi = new_zi;
+        mpfr_sqr(zr2, zr, MPFR_RNDN);
+        mpfr_sqr(zi2, zi, MPFR_RNDN);
+        mpfr_add(tmp, zr2, zi2, MPFR_RNDN);
+        /* Escape test only needs double precision: once |z| actually
+         * exceeds 2, it diverges within a couple more steps regardless
+         * of any correction far below a double's ULP.                  */
+        if (mpfr_get_d(tmp, MPFR_RNDN) >= 4.0) break;
+
+        mpfr_mul(zrzi, zr, zi, MPFR_RNDN);
+        mpfr_mul_2ui(zrzi, zrzi, 1, MPFR_RNDN);   /* 2*zr*zi */
+        mpfr_add(zi, zrzi, ci, MPFR_RNDN);        /* new zi */
+
+        mpfr_sub(tmp, zr2, zi2, MPFR_RNDN);
+        mpfr_add(zr, tmp, cr, MPFR_RNDN);         /* new zr */
+
         iter++;
     }
+
+    mpfr_clears(zr, zi, zr2, zi2, zrzi, tmp, (mpfr_ptr)0);
     return iter;
 }
 
-#pragma GCC pop_options
-
 /* ─── reference orbit ────────────────────────────────────────────────────── */
 
-Orbit *orbit_new(double cx, double cy, int max_iter)
+Orbit *orbit_new(const mpfr_t cx, const mpfr_t cy, int max_iter)
 {
     Orbit *o = calloc(1, sizeof *o);
     if (!o) return NULL;
 
-    o->cx = cx;
-    o->cy = cy;
+    mpfr_prec_t prec = mpfr_get_prec(cx);
+    if (mpfr_get_prec(cy) > prec) prec = mpfr_get_prec(cy);
+    if (prec < 53) prec = 53;
+
+    mpfr_init2(o->cx, prec);
+    mpfr_init2(o->cy, prec);
+    mpfr_set(o->cx, cx, MPFR_RNDN);
+    mpfr_set(o->cy, cy, MPFR_RNDN);
 
     /* allocate with +2 spare */
     o->Z  = malloc((max_iter + 2) * sizeof *o->Z);
@@ -124,17 +108,52 @@ Orbit *orbit_new(double cx, double cy, int max_iter)
     o->sC = malloc((max_iter + 2) * sizeof *o->sC);
     if (!o->Z || !o->sA || !o->sB || !o->sC) { orbit_free(o); return NULL; }
 
-    /* ── reference orbit ── */
-    cx_t c  = { cx, cy };
-    cx_t Zn = { 0.0, 0.0 };
-    int  n;
+    /* ── reference orbit, iterated at full MPFR precision ──
+     * The chaotic map amplifies any rounding error introduced at step k
+     * by roughly the local derivative (|2*Z_k|) at every later step, so
+     * the *iteration itself* — not just the input c — has to be carried
+     * at the precision the zoom depth demands. Only each step's already-
+     * computed result is well-conditioned enough to downcast to a plain
+     * double for the (unchanged) double-precision SA/BLA/perturbation
+     * math below — that's the whole point of perturbation theory: pay
+     * for precision once here, not on every pixel.                      */
+    mpfr_t zr, zi, zr2, zi2, zrzi, tmp;
+    mpfr_inits2(prec, zr, zi, zr2, zi2, zrzi, tmp, (mpfr_ptr)0);
+    mpfr_set_zero(zr, 1);
+    mpfr_set_zero(zi, 1);
+
+    int n;
     for (n = 0; n < max_iter; n++) {
-        o->Z[n] = Zn;
-        if (cx_abs2(Zn) > 4.0) break;
+        o->Z[n].r = mpfr_get_d(zr, MPFR_RNDN);
+        o->Z[n].i = mpfr_get_d(zi, MPFR_RNDN);
+        if (cx_abs2(o->Z[n]) > 4.0) break;
+
         /* Z_{n+1} = Z_n^2 + c */
-        Zn = cx_add(cx_mul(Zn, Zn), c);
+        mpfr_sqr(zr2, zr, MPFR_RNDN);
+        mpfr_sqr(zi2, zi, MPFR_RNDN);
+        mpfr_mul(zrzi, zr, zi, MPFR_RNDN);
+        mpfr_mul_2ui(zrzi, zrzi, 1, MPFR_RNDN);
+        mpfr_add(zi, zrzi, cy, MPFR_RNDN);
+        mpfr_sub(tmp, zr2, zi2, MPFR_RNDN);
+        mpfr_add(zr, tmp, cx, MPFR_RNDN);
     }
-    o->len = n; /* orbit has Z[0..n-1]; Z[n] would be escaped or == Z_{max} */
+    o->len = n; /* orbit has Z[0..n-1], plus Z[n] below: escaped, or the
+                 * value after exactly max_iter iterations.              */
+
+    /* If the loop broke out early (escape), Z[n] was already stored by
+     * the body above before the break. If it ran to completion instead,
+     * Z[max_iter] was never stored — the loop body's store happens at
+     * the *start* of each iteration, so the value computed by the final
+     * iteration (now sitting in zr/zi) was never written back. Store it
+     * here so every "next reference point" lookup below has real data
+     * even at the very end of the orbit, instead of silently reusing
+     * the previous iteration's (wrong) value.                          */
+    if (n == max_iter) {
+        o->Z[n].r = mpfr_get_d(zr, MPFR_RNDN);
+        o->Z[n].i = mpfr_get_d(zi, MPFR_RNDN);
+    }
+
+    mpfr_clears(zr, zi, zr2, zi2, zrzi, tmp, (mpfr_ptr)0);
 
     /* ── SA coefficients ── */
     /* A_{n+1} = 2*Z_n*A_n + 1,  B_{n+1} = 2*Z_n*B_n + A_n^2
@@ -257,6 +276,8 @@ void orbit_select(Orbit *o, double max_delta)
 void orbit_free(Orbit *o)
 {
     if (!o) return;
+    mpfr_clear(o->cx);
+    mpfr_clear(o->cy);
     free(o->Z);
     free(o->sA);
     free(o->sB);
@@ -275,11 +296,17 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
     /* If reference orbit is very short (reference escapes almost
      * immediately), perturbation has nothing useful to skip — go direct. */
     if (o->len < 2) {
+        mpfr_prec_t prec = mpfr_get_prec(o->cx);
+        mpfr_t cr, ci;
+        mpfr_init2(cr, prec);
+        mpfr_init2(ci, prec);
         for (int x = 0; x < w; x++) {
-            dd_t cr = dd_two_sum(o->cx, dcr[x]);
-            dd_t ci = dd_two_sum(o->cy, dci[x]);
-            out[x]  = scalar_mandelbrot_dd(cr, ci, max_iter);
+            mpfr_add_d(cr, o->cx, dcr[x], MPFR_RNDN);
+            mpfr_add_d(ci, o->cy, dci[x], MPFR_RNDN);
+            out[x] = scalar_mandelbrot_mp(cr, ci, max_iter);
         }
+        mpfr_clear(cr);
+        mpfr_clear(ci);
         return;
     }
 
@@ -353,7 +380,7 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
      * is free (no polynomial evaluation) and catches the single most
      * common "escapes immediately" case (|c| > 2) cheaply.               */
     if (sa_n > 1) {
-        int idx1 = (1 < o->len) ? 1 : (o->len < max_iter ? o->len : o->len - 1);
+        int idx1 = (1 < o->len) ? 1 : o->len;
         double Znr = o->Z[idx1].r, Zni = o->Z[idx1].i;
         for (int x = 0; x < w; x++) {
             double Wr = Znr + dcr[x];
@@ -367,8 +394,7 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
      * would iterate one step further before noticing, reporting an
      * escape iteration one too high.                                     */
     {
-        int idx = (sa_n < o->len) ? sa_n
-                : (o->len < max_iter ? o->len : o->len - 1);
+        int idx = (sa_n < o->len) ? sa_n : o->len;
         double Znr = o->Z[idx].r, Zni = o->Z[idx].i;
         double Zmag2 = Znr*Znr + Zni*Zni;
         for (int x = 0; x < w; x++) {
@@ -453,13 +479,14 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
 
         /* After applying BLA step, check escape at new position n.
          * Use Z[n] if available. If n lands exactly at the end of the
-         * recorded orbit and the reference itself escaped (o->len <
-         * max_iter), Z[o->len] still holds that valid escaped value —
-         * use it instead of stale Z[len-1], which corrupts W = Z+δ and
-         * causes widespread wrong escape iterations near the orbit's
-         * own escape point (the single most common perturbation glitch). */
-        int Zn_idx = (n < o->len) ? n
-                   : (o->len < max_iter ? o->len : o->len - 1);
+         * recorded orbit, Z[o->len] still holds a valid value — either
+         * the reference's escaped point, or (if the reference ran the
+         * full max_iter without escaping) the value after exactly
+         * max_iter iterations, stored by orbit_new() for this purpose.
+         * Using anything else here corrupts W = Z+δ and causes wrong
+         * escape iterations near the orbit's own endpoint (the single
+         * most common perturbation glitch).                            */
+        int Zn_idx = (n < o->len) ? n : o->len;
         double Znr = o->Z[Zn_idx].r, Zni = o->Z[Zn_idx].i;
         double Zmag2 = Znr*Znr + Zni*Zni;
         for (int x = 0; x < w; x++) {
@@ -543,11 +570,11 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
 
             /* Escape check: |Z_{nn+1} + δ_{nn+1}|² > 4
              * Z_{nn+1} is Z[nn+1] if available; if nn+1 lands exactly at
-             * the recorded orbit's end and the reference escaped early
-             * (o->len < max_iter), Z[o->len] is still the valid escaped
-             * value and must be used instead of stale Z[len-1].         */
-            int next_idx = (nn + 1 < o->len) ? nn + 1
-                          : (o->len < max_iter ? o->len : o->len - 1);
+             * the recorded orbit's end, Z[o->len] is still valid (the
+             * escaped value, or the value after exactly max_iter
+             * iterations — see orbit_new()) and must be used instead of
+             * stale Z[len-1].                                           */
+            int next_idx = (nn + 1 < o->len) ? nn + 1 : o->len;
             double Zr1 = o->Z[next_idx].r, Zi1 = o->Z[next_idx].i;
             __m256d vZr1 = _mm256_set1_pd(Zr1);
             __m256d vZi1 = _mm256_set1_pd(Zi1);
@@ -624,8 +651,7 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
             double ndr  = 2.0*(Znr*pdr - Zni*pdi) + dr2 + dcr[x];
             double ndi  = 2.0*(Znr*pdi + Zni*pdr) + di2 + dci[x];
             pdr = ndr; pdi = ndi;
-            int ni = (nn+1 < o->len) ? nn+1
-                   : (o->len < max_iter ? o->len : o->len-1);
+            int ni = (nn+1 < o->len) ? nn+1 : o->len;
             double Zr1 = o->Z[ni].r, Zi1 = o->Z[ni].i;
             double Wr = Zr1 + pdr;
             double Wi = Zi1 + pdi;
@@ -651,15 +677,30 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
         }
     }
 
-    /* Copy results to output, recomputing glitched pixels directly */
-    for (int xx = 0; xx < w; xx++) {
-        if (glitched[xx]) {
-            dd_t cr = dd_two_sum(o->cx, dcr[xx]);
-            dd_t ci = dd_two_sum(o->cy, dci[xx]);
-            out[xx] = scalar_mandelbrot_dd(cr, ci, max_iter);
-        } else {
-            out[xx] = (iter_count[xx] < 0) ? max_iter : iter_count[xx];
+    /* Copy results to output, recomputing glitched pixels directly.
+     * The MPFR scratch pair is only set up if this row actually has a
+     * glitched pixel — the common case has none, and mpfr_init2 isn't
+     * free.                                                            */
+    {
+        int any_glitched = 0;
+        for (int xx = 0; xx < w; xx++) if (glitched[xx]) { any_glitched = 1; break; }
+
+        mpfr_t cr, ci;
+        if (any_glitched) {
+            mpfr_prec_t prec = mpfr_get_prec(o->cx);
+            mpfr_init2(cr, prec);
+            mpfr_init2(ci, prec);
         }
+        for (int xx = 0; xx < w; xx++) {
+            if (glitched[xx]) {
+                mpfr_add_d(cr, o->cx, dcr[xx], MPFR_RNDN);
+                mpfr_add_d(ci, o->cy, dci[xx], MPFR_RNDN);
+                out[xx] = scalar_mandelbrot_mp(cr, ci, max_iter);
+            } else {
+                out[xx] = (iter_count[xx] < 0) ? max_iter : iter_count[xx];
+            }
+        }
+        if (any_glitched) { mpfr_clear(cr); mpfr_clear(ci); }
     }
 
     free(dr);

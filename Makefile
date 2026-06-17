@@ -1,6 +1,6 @@
 CC     = gcc
 CFLAGS = -O3 -march=native -funroll-loops -ffast-math -fopenmp -mavx2 -mfma -Wall -Wextra -Wno-unused-result
-LIBS   = -lm -lz -fopenmp
+LIBS   = -lm -lz -lmpfr -lgmp -fopenmp
 
 .PHONY: all clean
 

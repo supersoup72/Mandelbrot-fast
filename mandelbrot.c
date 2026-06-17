@@ -20,6 +20,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <math.h>
+#include <mpfr.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -76,14 +77,48 @@ static void term_size(int *w, int *h) {
 
 /* ─── view state ────────────────────────────────────────────────────────── */
 
-static double g_cx   = -0.5;
-static double g_cy   =  0.0;
+/* The view center is stored at arbitrary precision: a plain double can
+ * only pin a coordinate down to ~53 bits (~1e15-16), and past that the
+ * reference orbit built from it drifts from the location the user
+ * actually navigated to, no matter how precisely per-pixel deltas are
+ * computed against it — the entire image is derived from one shared
+ * orbit, so this is the actual ceiling on zoom depth, not a fallback
+ * detail. Precision is grown (never shrunk) to track g_zoom — see
+ * ensure_view_precision() — so a long pan-and-zoom session accumulates
+ * exactly as many bits as the path taken actually needs, no more.       */
+static mpfr_t  g_cx;
+static mpfr_t  g_cy;
 static double g_zoom =  1.0;
 static int    g_iter =  128;
 static double g_dens =  8.0;
 static double g_render_ms = 0.0;
 static char   g_msg[160] = "";
 static int    g_truecolor = 1;
+
+/* Minimum bits to keep beyond log2(zoom): covers the usual double's 53
+ * plus headroom so panning right after a zoom-in doesn't immediately
+ * exhaust the freshly-grown precision.                                  */
+#define PREC_MARGIN_BITS 64
+
+static mpfr_prec_t bits_for_zoom(double zoom) {
+    double bits = PREC_MARGIN_BITS + (zoom > 1.0 ? log2(zoom) : 0.0);
+    if (bits < PREC_MARGIN_BITS) bits = PREC_MARGIN_BITS;
+    return (mpfr_prec_t)bits;
+}
+
+/* mpfr_*_d functions round their result to the *destination*'s current
+ * precision — so before nudging g_cx/g_cy by a pan delta (or relying on
+ * them for a render), precision has to already be grown to match the
+ * current zoom, or the delta (or the orbit built from them) gets
+ * silently truncated away exactly like the original double ceiling.
+ * mpfr_prec_round preserves the existing value while changing the
+ * storage precision (padding with zero bits), so this never invents
+ * precision that wasn't already navigated to.                          */
+static void ensure_view_precision(void) {
+    mpfr_prec_t need = bits_for_zoom(g_zoom);
+    if (mpfr_get_prec(g_cx) < need) mpfr_prec_round(g_cx, need, MPFR_RNDN);
+    if (mpfr_get_prec(g_cy) < need) mpfr_prec_round(g_cy, need, MPFR_RNDN);
+}
 
 /* ─── view geometry ──────────────────────────────────────────────────────
  * Coordinates are sampled on a grid of square "sub-pixels": W columns by
@@ -124,33 +159,48 @@ static void view_geometry(int *Wp, int *hp, int *php,
  * orbit_select() rescan, instead of rebuilding the whole BLA pyramid from
  * scratch on every single frame.                                          */
 
-static Orbit *g_orbit     = NULL;
-static double g_orbit_cx  = 0.0/0.0;
-static double g_orbit_cy  = 0.0/0.0;
+static Orbit *g_orbit      = NULL;
+static mpfr_t  g_orbit_cx;
+static mpfr_t  g_orbit_cy;
 static int    g_orbit_iter = -1;
+static int    g_orbit_valid = 0;
 
-static Orbit *get_orbit(double cx, double cy, int mi, double max_delta) {
-    if (!g_orbit || cx != g_orbit_cx || cy != g_orbit_cy || mi != g_orbit_iter) {
+static Orbit *get_orbit(const mpfr_t cx, const mpfr_t cy, int mi, double max_delta) {
+    int changed = !g_orbit || !g_orbit_valid ||
+                  !mpfr_equal_p(cx, g_orbit_cx) || !mpfr_equal_p(cy, g_orbit_cy) ||
+                  mi != g_orbit_iter;
+    if (changed) {
         orbit_free(g_orbit);
-        g_orbit     = orbit_new(cx, cy, mi);
-        g_orbit_cx  = cx;
-        g_orbit_cy  = cy;
-        g_orbit_iter = mi;
+        g_orbit = orbit_new(cx, cy, mi);
+        if (mpfr_get_prec(g_orbit_cx) < mpfr_get_prec(cx))
+            mpfr_prec_round(g_orbit_cx, mpfr_get_prec(cx), MPFR_RNDN);
+        if (mpfr_get_prec(g_orbit_cy) < mpfr_get_prec(cy))
+            mpfr_prec_round(g_orbit_cy, mpfr_get_prec(cy), MPFR_RNDN);
+        mpfr_set(g_orbit_cx, cx, MPFR_RNDN);
+        mpfr_set(g_orbit_cy, cy, MPFR_RNDN);
+        g_orbit_iter  = mi;
+        g_orbit_valid = 1;
     }
     if (g_orbit) orbit_select(g_orbit, max_delta);
     return g_orbit;
 }
 
 /* ─── scalar fallback Mandelbrot (used only if orbit allocation fails) ──── */
-/* Uses double-double precision (scalar_mandelbrot_dd, from orbit.c) since
- * this still has to add a per-pixel delta to an absolute coordinate, the
- * same cancellation orbit_render_row()'s own fallback paths avoid — see
- * dd_two_sum() in orbit.h.                                               */
+/* Uses full MPFR precision (scalar_mandelbrot_mp, from orbit.c) since this
+ * still has to add a per-pixel delta to an absolute coordinate that may
+ * need far more than a double's 53 bits to specify at deep zoom.        */
 
-static int scalar_fallback(double cx, double cy, double dcr, double dci, int max_iter) {
-    dd_t cr = dd_two_sum(cx, dcr);
-    dd_t ci = dd_two_sum(cy, dci);
-    return scalar_mandelbrot_dd(cr, ci, max_iter);
+static int scalar_fallback(const mpfr_t cx, const mpfr_t cy, double dcr, double dci, int max_iter) {
+    mpfr_prec_t prec = mpfr_get_prec(cx);
+    mpfr_t cr, ci;
+    mpfr_init2(cr, prec);
+    mpfr_init2(ci, prec);
+    mpfr_add_d(cr, cx, dcr, MPFR_RNDN);
+    mpfr_add_d(ci, cy, dci, MPFR_RNDN);
+    int result = scalar_mandelbrot_mp(cr, ci, max_iter);
+    mpfr_clear(cr);
+    mpfr_clear(ci);
+    return result;
 }
 
 /* ─── continuous truecolor iteration→RGB table ──────────────────────────── */
@@ -336,7 +386,12 @@ static void render(void) {
         fp += g_rlens[y];
     }
 
-    /* Status bar with SA/BLA debug info, render time, and last message */
+    /* Status bar with SA/BLA debug info, render time, and last message.
+     * cx/cy are only rounded to double for this %g display — the actual
+     * render above used their full precision; this is a UI nicety that
+     * only ever shows ~8 significant digits anyway.                    */
+    double cx_disp = mpfr_get_d(g_cx, MPFR_RNDN);
+    double cy_disp = mpfr_get_d(g_cy, MPFR_RNDN);
     fp += snprintf(g_frame+fp, STATUS_RESERVE,
         "\033[0m\033[%d;1H\033[K"
         "  \033[1mcx\033[0m=%-14.8g"
@@ -348,7 +403,7 @@ static void render(void) {
         "  color=%s"
         "%s%s"
         "  \033[2m[wasd]move [z/x]zoom [i/o]iter [k/l]color [p]png [t]color-mode [M]anim [q]quit\033[0m",
-        h+1, g_cx, g_cy, g_zoom, g_iter,
+        h+1, cx_disp, cy_disp, g_zoom, g_iter,
         sa_skip, bla_levs, g_render_ms,
         g_truecolor ? "truecolor" : "16-color",
         g_msg[0] ? "  " : "", g_msg);
@@ -568,6 +623,11 @@ static void play_zoom_out(double factor, int *quit) {
 /* ─── main ──────────────────────────────────────────────────────────────── */
 
 int main(void) {
+    mpfr_init2(g_cx, PREC_MARGIN_BITS); mpfr_set_d(g_cx, -0.5, MPFR_RNDN);
+    mpfr_init2(g_cy, PREC_MARGIN_BITS); mpfr_set_d(g_cy,  0.0, MPFR_RNDN);
+    mpfr_init2(g_orbit_cx, PREC_MARGIN_BITS);
+    mpfr_init2(g_orbit_cy, PREC_MARGIN_BITS);
+
     term_init();
     build_itable();
     render();
@@ -587,21 +647,30 @@ int main(void) {
         double vs = 0.25 / g_zoom;
         double hs = 0.50 / g_zoom;
 
+        /* Grow g_cx/g_cy's precision to match the current zoom *before*
+         * any pan below — mpfr_*_d rounds to the destination's existing
+         * precision, so without this a pan delta below the current bit
+         * budget would be silently truncated away, same as the original
+         * double ceiling.                                              */
+        ensure_view_precision();
+
         switch (c) {
         case 'q': case 'Q': goto quit;
 
-        case 'w': case 'W': g_cy -= vs; break;
-        case 's': case 'S': g_cy += vs; break;
-        case 'a': case 'A': g_cx -= hs; break;
-        case 'd': case 'D': g_cx += hs; break;
+        case 'w': case 'W': mpfr_sub_d(g_cy, g_cy, vs, MPFR_RNDN); break;
+        case 's': case 'S': mpfr_add_d(g_cy, g_cy, vs, MPFR_RNDN); break;
+        case 'a': case 'A': mpfr_sub_d(g_cx, g_cx, hs, MPFR_RNDN); break;
+        case 'd': case 'D': mpfr_add_d(g_cx, g_cx, hs, MPFR_RNDN); break;
 
         case 'z': case 'Z':
-            /* Per-pixel deltas are computed without ever round-tripping
-             * through the absolute center (see view_geometry()), so
-             * double precision holds up far past the old 1e14 cap that
-             * was masking that cancellation bug. 1e17 leaves headroom
-             * below where sx itself would underflow.                   */
-            if (g_zoom < 1e17) g_zoom *= 1.5;
+            /* The reference orbit is now built at MPFR precision tracking
+             * zoom depth (see ensure_view_precision()/bits_for_zoom()),
+             * so there's no longer a precision-driven cap here. The one
+             * remaining limit is that sx (1.25/zoom/h, deliberately kept
+             * a plain double — see view_geometry()) underflows to 0 once
+             * zoom nears double's ~1e308 exponent ceiling; 1e270 leaves
+             * comfortable headroom below that.                         */
+            if (g_zoom < 1e270) g_zoom *= 1.5;
             break;
         case 'x': case 'X':
             if (g_zoom > 1e-4) g_zoom /= 1.5;
