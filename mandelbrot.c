@@ -259,14 +259,23 @@ static void render(void) {
         double ci_top = y0 + (2*y)     * sy;
         double ci_bot = y0 + (2*y + 1) * sy;
 
-        double *dcr     = malloc(W * sizeof(double));
-        double *dci_top = malloc(W * sizeof(double));
-        double *dci_bot = malloc(W * sizeof(double));
-        int    *irow_top= malloc(W * sizeof(int));
-        int    *irow_bot= malloc(W * sizeof(int));
-
-        if (!dcr || !dci_top || !dci_bot || !irow_top || !irow_bot) {
+        /* Per-thread scratch buffers, grown (never shrunk) and reused
+         * across calls — render() can run thousands of times during a
+         * long animation, so per-row malloc/free churn adds up fast.    */
+        static __thread double *dcr = NULL, *dci_top = NULL, *dci_bot = NULL;
+        static __thread int    *irow_top = NULL, *irow_bot = NULL;
+        static __thread int     cap = 0;
+        if (cap < W) {
             free(dcr); free(dci_top); free(dci_bot); free(irow_top); free(irow_bot);
+            dcr      = malloc(W * sizeof(double));
+            dci_top  = malloc(W * sizeof(double));
+            dci_bot  = malloc(W * sizeof(double));
+            irow_top = malloc(W * sizeof(int));
+            irow_bot = malloc(W * sizeof(int));
+            cap = (dcr && dci_top && dci_bot && irow_top && irow_bot) ? W : 0;
+        }
+
+        if (cap < W) {
             g_rlens[y] = 0;
             continue;
         }
@@ -313,8 +322,6 @@ static void render(void) {
         }
         rb[rp++] = '\n';
         g_rlens[y] = rp;
-
-        free(dcr); free(dci_top); free(dci_bot); free(irow_top); free(irow_bot);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -354,9 +361,12 @@ static void render(void) {
 
 /* Renders the current view at oversampled resolution (target ~1920px
  * wide, rather than just upscaling terminal cells) and writes it to
- * `fname`. Returns 0 on success; pw_out / ph_out / ms_out receive the
- * pixel dimensions used and the render time, for status messages.       */
-static int render_view_to_png(const char *fname, int *pw_out, int *ph_out, double *ms_out) {
+ * `fname` using zlib level `png_level` (lower = faster, bigger files —
+ * see write_png()). Returns 0 on success; pw_out / ph_out / ms_out
+ * receive the pixel dimensions used and the render time, for status
+ * messages.                                                              */
+static int render_view_to_png(const char *fname, int png_level,
+                               int *pw_out, int *ph_out, double *ms_out) {
     int W, h, ph;
     double sx, sy, x0, y0;
     view_geometry(&W, &h, &ph, &sx, &sy, &x0, &y0);
@@ -386,10 +396,20 @@ static int render_view_to_png(const char *fname, int *pw_out, int *ph_out, doubl
     for (int y = 0; y < phh; y++) {
         double ci = y0 + y * psy - g_cy;
 
-        double *dcr = malloc(pw * sizeof(double));
-        double *dci = malloc(pw * sizeof(double));
-        int    *irow= malloc(pw * sizeof(int));
-        if (!dcr || !dci || !irow) { free(dcr); free(dci); free(irow); continue; }
+        /* Per-thread scratch buffers, grown (never shrunk) and reused
+         * across calls — an animation can call this hundreds of times,
+         * each with up to ~2x the row count of the terminal view.       */
+        static __thread double *dcr = NULL, *dci = NULL;
+        static __thread int    *irow = NULL;
+        static __thread int     cap = 0;
+        if (cap < pw) {
+            free(dcr); free(dci); free(irow);
+            dcr  = malloc(pw * sizeof(double));
+            dci  = malloc(pw * sizeof(double));
+            irow = malloc(pw * sizeof(int));
+            cap = (dcr && dci && irow) ? pw : 0;
+        }
+        if (cap < pw) continue;
 
         for (int x = 0; x < pw; x++) {
             dcr[x] = x0 + x * psx - g_cx;
@@ -408,13 +428,11 @@ static int render_view_to_png(const char *fname, int *pw_out, int *ph_out, doubl
             RGB c = g_tab[irow[x] < mi ? irow[x] : mi];
             row[x*3+0] = c.r; row[x*3+1] = c.g; row[x*3+2] = c.b;
         }
-
-        free(dcr); free(dci); free(irow);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
-    int ok = write_png(fname, pw, phh, rgb) == 0;
+    int ok = write_png(fname, pw, phh, rgb, png_level) == 0;
     free(rgb);
 
     *pw_out = pw; *ph_out = phh;
@@ -435,7 +453,8 @@ static void save_png(void) {
 
     int pw, ph;
     double ms;
-    int ok = render_view_to_png(fname, &pw, &ph, &ms) == 0;
+    /* A deliberate single "keeper" save: use good compression (zlib 6). */
+    int ok = render_view_to_png(fname, 6, &pw, &ph, &ms) == 0;
 
     if (ok)
         snprintf(g_msg, sizeof g_msg, "saved %s (%dx%d, %.0fms)", fname, pw, ph, ms);
@@ -511,7 +530,9 @@ static void play_zoom_out(double factor, int *quit) {
 
         int pw = 0, ph = 0;
         double ms = 0.0;
-        int ok = render_view_to_png(fname, &pw, &ph, &ms) == 0;
+        /* Animation frames are disposable inputs to ffmpeg — favor fast
+         * writes (zlib level 1) over file size.                         */
+        int ok = render_view_to_png(fname, 1, &pw, &ph, &ms) == 0;
 
         if (ok)
             snprintf(g_msg, sizeof g_msg, "saving frame %d (zoom=%.4g, %dx%d, %.0fms): %s",

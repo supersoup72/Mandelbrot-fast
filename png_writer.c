@@ -26,7 +26,7 @@ static void write_chunk(FILE *f, const char *type, const unsigned char *data, un
     fwrite(crcbuf, 1, 4, f);
 }
 
-int write_png(const char *filename, int width, int height, const unsigned char *rgb)
+int write_png(const char *filename, int width, int height, const unsigned char *rgb, int level)
 {
     FILE *f = fopen(filename, "wb");
     if (!f) return -1;
@@ -59,7 +59,7 @@ int write_png(const char *filename, int width, int height, const unsigned char *
     unsigned char *comp = malloc(comp_cap);
     if (!comp) { free(raw); fclose(f); return -1; }
     unsigned long comp_len = comp_cap;
-    int zr = compress2(comp, &comp_len, raw, raw_len, 6);
+    int zr = compress2(comp, &comp_len, raw, raw_len, level);
     free(raw);
     if (zr != Z_OK) { free(comp); fclose(f); return -1; }
 

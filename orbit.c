@@ -31,6 +31,12 @@ static inline cx_t cx_scale(cx_t a, double s) {
  * branch. Flagged pixels are recomputed directly (see scalar_mandelbrot). */
 #define GLITCH_EPS2 1e-12   /* (1e-6)^2 */
 
+/* Below this many elements, OpenMP's thread spawn/join overhead exceeds
+ * the work being parallelized — measured break-even is ~20k elements for
+ * the simple per-entry BLA composition below, so smaller loops are left
+ * to run serially via the `if()` clause rather than forking threads.    */
+#define OMP_PAR_THRESHOLD 20000
+
 /* ─── direct (non-perturbed) scalar Mandelbrot, for fallback/glitch fix ──── */
 
 static int scalar_mandelbrot(double cr, double ci, int max_iter)
@@ -115,6 +121,7 @@ Orbit *orbit_new(double cx, double cy, int max_iter)
     if (o->len > 1) {
         o->bla[0] = malloc(o->len * sizeof *o->bla[0]);
         if (!o->bla[0]) { orbit_free(o); return NULL; }
+        #pragma omp parallel for schedule(static) if(o->len > OMP_PAR_THRESHOLD)
         for (int k = 0; k < o->len; k++) {
             cx_t twoZ = cx_scale(o->Z[k], 2.0);
             double r2_twoZ = cx_abs2(twoZ);
@@ -125,7 +132,9 @@ Orbit *orbit_new(double cx, double cy, int max_iter)
         levels = 1;
 
         /* Level j from level j-1: step = 2^j.
-         * Compose bla[j-1][n] with bla[j-1][n + 2^(j-1)].              */
+         * Compose bla[j-1][n] with bla[j-1][n + 2^(j-1)]. Each entry only
+         * reads the fully-built level j-1 array, so the k-loop within a
+         * fixed j is embarrassingly parallel.                            */
         for (int j = 1; j < BLA_LEVELS; j++) {
             int half_step = 1 << (j - 1);
             int step      = 1 << j;
@@ -134,8 +143,11 @@ Orbit *orbit_new(double cx, double cy, int max_iter)
             o->bla[j] = malloc(o->len * sizeof *o->bla[j]);
             if (!o->bla[j]) break;
 
-            int valid_count = 0;
-            for (int k = 0; k + step <= o->len; k++) {
+            /* trip count is len - step + 1, always >= 2 here since the
+             * step >= o->len check above already ruled out an empty range */
+            int trip = o->len - step + 1;
+            #pragma omp parallel for schedule(static) if(trip > OMP_PAR_THRESHOLD)
+            for (int k = 0; k < trip; k++) {
                 BlaEntry *e1 = &o->bla[j-1][k];
                 BlaEntry *e2 = &o->bla[j-1][k + half_step];
                 /* compose: δ_1 = A1*δ + B1*Δc
@@ -154,12 +166,6 @@ Orbit *orbit_new(double cx, double cy, int max_iter)
                 o->bla[j][k].A  = A;
                 o->bla[j][k].B  = B;
                 o->bla[j][k].r2 = r2;
-                valid_count++;
-            }
-            if (valid_count == 0) {
-                free(o->bla[j]);
-                o->bla[j] = NULL;
-                break;
             }
             levels = j + 1;
         }
@@ -234,20 +240,43 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
 
     cx_t sA = o->sa_A;
     cx_t sB = o->sa_B;
-    for (int x = 0; x < w; x++) {
-        double Dcr = dcr[x], Dci = dci[x];
-        /* δ = A*Δc + B*Δc^2 */
-        /* A*Δc */
-        double Ar = sA.r*Dcr - sA.i*Dci;
-        double Ai = sA.r*Dci + sA.i*Dcr;
-        /* Δc^2 */
-        double Dc2r = Dcr*Dcr - Dci*Dci;
-        double Dc2i = 2.0*Dcr*Dci;
-        /* B*Δc^2 */
-        double Br = sB.r*Dc2r - sB.i*Dc2i;
-        double Bi = sB.r*Dc2i + sB.i*Dc2r;
-        dr[x] = Ar + Br;
-        di[x] = Ai + Bi;
+    {
+        __m256d vAr = _mm256_set1_pd(sA.r), vAi = _mm256_set1_pd(sA.i);
+        __m256d vBr = _mm256_set1_pd(sB.r), vBi = _mm256_set1_pd(sB.i);
+        __m256d two = _mm256_set1_pd(2.0);
+        int xv = 0;
+        for (; xv + 4 <= w; xv += 4) {
+            __m256d Dcr = _mm256_loadu_pd(&dcr[xv]);
+            __m256d Dci = _mm256_loadu_pd(&dci[xv]);
+
+            /* Δc^2 */
+            __m256d Dc2r = _mm256_fmsub_pd(Dcr, Dcr, _mm256_mul_pd(Dci, Dci));
+            __m256d Dc2i = _mm256_mul_pd(two, _mm256_mul_pd(Dcr, Dci));
+
+            /* δ = A*Δc + B*Δc^2 */
+            __m256d accR = _mm256_fmsub_pd(vBr, Dc2r, _mm256_mul_pd(vBi, Dc2i));
+            accR = _mm256_fmadd_pd(vAr, Dcr, accR);
+            accR = _mm256_fnmadd_pd(vAi, Dci, accR);
+
+            __m256d accI = _mm256_fmadd_pd(vBr, Dc2i, _mm256_mul_pd(vBi, Dc2r));
+            accI = _mm256_fmadd_pd(vAr, Dci, accI);
+            accI = _mm256_fmadd_pd(vAi, Dcr, accI);
+
+            _mm256_storeu_pd(&dr[xv], accR);
+            _mm256_storeu_pd(&di[xv], accI);
+        }
+        for (; xv < w; xv++) {
+            double Dcr = dcr[xv], Dci = dci[xv];
+            /* δ = A*Δc + B*Δc^2 */
+            double Ar = sA.r*Dcr - sA.i*Dci;
+            double Ai = sA.r*Dci + sA.i*Dcr;
+            double Dc2r = Dcr*Dcr - Dci*Dci;
+            double Dc2i = 2.0*Dcr*Dci;
+            double Br = sB.r*Dc2r - sB.i*Dc2i;
+            double Bi = sB.r*Dc2i + sB.i*Dc2r;
+            dr[xv] = Ar + Br;
+            di[xv] = Ai + Bi;
+        }
     }
 
     /* ── Phase 2: Global BLA loop ── */
@@ -348,16 +377,15 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
             __m256d Dcr_v  = _mm256_loadu_pd(&dcr[xx]);
             __m256d Dci_v  = _mm256_loadu_pd(&dci[xx]);
 
-            __m256d new_dr = _mm256_add_pd(
-                                _mm256_sub_pd(_mm256_mul_pd(vAr, old_dr),
-                                              _mm256_mul_pd(vAi, old_di)),
-                                _mm256_sub_pd(_mm256_mul_pd(vBr, Dcr_v),
-                                              _mm256_mul_pd(vBi, Dci_v)));
-            __m256d new_di = _mm256_add_pd(
-                                _mm256_add_pd(_mm256_mul_pd(vAr, old_di),
-                                              _mm256_mul_pd(vAi, old_dr)),
-                                _mm256_add_pd(_mm256_mul_pd(vBr, Dci_v),
-                                              _mm256_mul_pd(vBi, Dcr_v)));
+            /* δ_new = A*δ + B*Δc, fused into a chain of FMAs */
+            __m256d new_dr = _mm256_fmsub_pd(vBr, Dcr_v, _mm256_mul_pd(vBi, Dci_v));
+            new_dr = _mm256_fmadd_pd(vAr, old_dr, new_dr);
+            new_dr = _mm256_fnmadd_pd(vAi, old_di, new_dr);
+
+            __m256d new_di = _mm256_fmadd_pd(vBr, Dci_v, _mm256_mul_pd(vBi, Dcr_v));
+            new_di = _mm256_fmadd_pd(vAr, old_di, new_di);
+            new_di = _mm256_fmadd_pd(vAi, old_dr, new_di);
+
             _mm256_storeu_pd(&dr[xx], new_dr);
             _mm256_storeu_pd(&di[xx], new_di);
         }
@@ -440,15 +468,14 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
             __m256d tZi  = _mm256_mul_pd(two, vZi);
 
             /* δ^2 */
-            __m256d dr2  = _mm256_sub_pd(_mm256_mul_pd(vdr, vdr),
-                                          _mm256_mul_pd(vdi, vdi));
+            __m256d dr2  = _mm256_fmsub_pd(vdr, vdr, _mm256_mul_pd(vdi, vdi));
             __m256d di2  = _mm256_mul_pd(_mm256_mul_pd(two, vdr), vdi);
 
             /* new δ = 2*Z_n*δ + δ^2 + Δc */
             /* real: tZr*dr - tZi*di + dr2 + Dcr */
             __m256d new_dr = _mm256_add_pd(
                                _mm256_add_pd(
-                                 _mm256_sub_pd(_mm256_mul_pd(tZr, vdr),
+                                 _mm256_fmsub_pd(tZr, vdr,
                                                _mm256_mul_pd(tZi, vdi)),
                                  dr2),
                                vDcr);
