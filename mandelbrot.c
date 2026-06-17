@@ -2,11 +2,14 @@
  *
  *  wasd    pan              z / x   zoom in / out
  *  i / o   more/fewer iter  k / l   color density up / down
- *  p       save PNG         q       quit
+ *  p       save PNG         t       toggle truecolor / 16-color
+ *  q       quit
  *
  *  Rendering uses Unicode upper-half-block glyphs (▀) with independent
- *  24-bit foreground/background colors, packing two vertical pixels per
- *  terminal cell for roughly double the effective resolution.
+ *  foreground/background colors, packing two vertical pixels per
+ *  terminal cell for roughly double the effective resolution. Colors are
+ *  24-bit truecolor by default, or the basic ANSI 16-color palette (for
+ *  terminals without truecolor support) via the 't' toggle.
  *
  *  Build:
  *    gcc -O3 -march=native -funroll-loops -ffast-math -fopenmp -mavx2 -mfma \
@@ -48,7 +51,10 @@ static void term_init(void) {
 
     struct termios raw = g_orig;
     raw.c_iflag &= ~(IXON | ICRNL | BRKINT | INPCK | ISTRIP);
-    raw.c_oflag &= ~OPOST;
+    /* Leave c_oflag (and ONLCR) untouched: render() writes rows terminated
+     * by a bare '\n', relying on the kernel's normal LF->CRLF translation
+     * to return the cursor to column 1. Clearing OPOST turns that off and
+     * corrupts every row after the first via column drift.                */
     raw.c_cflag |=  CS8;
     raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
     raw.c_cc[VMIN]  = 1;
@@ -74,6 +80,7 @@ static int    g_iter =  128;
 static double g_dens =  8.0;
 static double g_render_ms = 0.0;
 static char   g_msg[160] = "";
+static int    g_truecolor = 1;
 
 /* ─── view geometry ──────────────────────────────────────────────────────
  * Coordinates are sampled on a grid of square "sub-pixels": W columns by
@@ -144,6 +151,28 @@ static void build_itable(void) {
         g_tab[i].g = (unsigned char)(g * 255.0 + 0.5);
         g_tab[i].b = (unsigned char)(b * 255.0 + 0.5);
     }
+}
+
+/* ─── 16-color ANSI fallback (for terminals without truecolor) ──────────── */
+
+static const RGB ANSI16[16] = {
+    {  0,  0,  0}, {205,  0,  0}, {  0,205,  0}, {205,205,  0},
+    {  0,  0,205}, {205,  0,205}, {  0,205,205}, {229,229,229},
+    {127,127,127}, {255,  0,  0}, {  0,255,  0}, {255,255,  0},
+    {  0,  0,255}, {255,  0,255}, {  0,255,255}, {255,255,255},
+};
+
+static int nearest_ansi16(RGB c) {
+    int best = 0;
+    long bestd = -1;
+    for (int i = 0; i < 16; i++) {
+        long dr = (long)c.r - ANSI16[i].r;
+        long dg = (long)c.g - ANSI16[i].g;
+        long db = (long)c.b - ANSI16[i].b;
+        long d = dr*dr + dg*dg + db*db;
+        if (bestd < 0 || d < bestd) { bestd = d; best = i; }
+    }
+    return best;
 }
 
 /* ─── output buffers ────────────────────────────────────────────────────── */
@@ -236,11 +265,21 @@ static void render(void) {
             RGB bg = g_tab[irow_bot[x] < mi ? irow_bot[x] : mi];
 
             if (!have_fg || fg.r!=prev_fg.r || fg.g!=prev_fg.g || fg.b!=prev_fg.b) {
-                rp += snprintf(rb+rp, 20, "\033[38;2;%d;%d;%dm", fg.r, fg.g, fg.b);
+                if (g_truecolor) {
+                    rp += snprintf(rb+rp, 20, "\033[38;2;%d;%d;%dm", fg.r, fg.g, fg.b);
+                } else {
+                    int idx = nearest_ansi16(fg);
+                    rp += snprintf(rb+rp, 12, "\033[%dm", idx < 8 ? 30+idx : 90+(idx-8));
+                }
                 prev_fg = fg; have_fg = 1;
             }
             if (!have_bg || bg.r!=prev_bg.r || bg.g!=prev_bg.g || bg.b!=prev_bg.b) {
-                rp += snprintf(rb+rp, 20, "\033[48;2;%d;%d;%dm", bg.r, bg.g, bg.b);
+                if (g_truecolor) {
+                    rp += snprintf(rb+rp, 20, "\033[48;2;%d;%d;%dm", bg.r, bg.g, bg.b);
+                } else {
+                    int idx = nearest_ansi16(bg);
+                    rp += snprintf(rb+rp, 12, "\033[%dm", idx < 8 ? 40+idx : 100+(idx-8));
+                }
                 prev_bg = bg; have_bg = 1;
             }
             rb[rp++] = '\xe2'; rb[rp++] = '\x96'; rb[rp++] = '\x80'; /* ▀ */
@@ -274,10 +313,12 @@ static void render(void) {
         "  \033[1miter\033[0m=%-4d"
         "  SA=%-4d BLA=%-2d"
         "  render=%.1fms"
+        "  color=%s"
         "%s%s"
-        "  \033[2m[wasd]move [z/x]zoom [i/o]iter [k/l]color [p]png [q]quit\033[0m",
+        "  \033[2m[wasd]move [z/x]zoom [i/o]iter [k/l]color [p]png [t]color-mode [q]quit\033[0m",
         h+1, g_cx, g_cy, g_zoom, g_iter,
         sa_skip, bla_levs, g_render_ms,
+        g_truecolor ? "truecolor" : "16-color",
         g_msg[0] ? "  " : "", g_msg);
 
     (void)write(STDOUT_FILENO, g_frame, fp);
@@ -349,9 +390,15 @@ static void save_png(void) {
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
 
+    /* Sequence number guards against collisions when multiple exports
+     * land within the same wall-clock second (timestamp alone isn't
+     * unique enough since a render can finish in single-digit ms).    */
+    static int seq = 0;
     time_t now = time(NULL);
+    char stamp[32];
+    strftime(stamp, sizeof stamp, "%Y%m%d_%H%M%S", localtime(&now));
     char fname[64];
-    strftime(fname, sizeof fname, "mandelbrot_%Y%m%d_%H%M%S.png", localtime(&now));
+    snprintf(fname, sizeof fname, "mandelbrot_%s_%03d.png", stamp, seq++);
 
     int ok = write_png(fname, pw, phh, rgb) == 0;
     free(rgb);
@@ -410,6 +457,8 @@ int main(void) {
         case 'l': case 'L': g_dens /= 1.5; need_iet = 1; break;
 
         case 'p': case 'P': save_png(); break;
+
+        case 't': case 'T': g_truecolor = !g_truecolor; break;
 
         default: dirty = 0; break;
         }
