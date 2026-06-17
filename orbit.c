@@ -52,7 +52,7 @@ static int scalar_mandelbrot(double cr, double ci, int max_iter)
 
 /* ─── reference orbit ────────────────────────────────────────────────────── */
 
-Orbit *orbit_new(double cx, double cy, int max_iter, double max_delta)
+Orbit *orbit_new(double cx, double cy, int max_iter)
 {
     Orbit *o = calloc(1, sizeof *o);
     if (!o) return NULL;
@@ -64,7 +64,8 @@ Orbit *orbit_new(double cx, double cy, int max_iter, double max_delta)
     o->Z  = malloc((max_iter + 2) * sizeof *o->Z);
     o->sA = malloc((max_iter + 2) * sizeof *o->sA);
     o->sB = malloc((max_iter + 2) * sizeof *o->sB);
-    if (!o->Z || !o->sA || !o->sB) { orbit_free(o); return NULL; }
+    o->sC = malloc((max_iter + 2) * sizeof *o->sC);
+    if (!o->Z || !o->sA || !o->sB || !o->sC) { orbit_free(o); return NULL; }
 
     /* ── reference orbit ── */
     cx_t c  = { cx, cy };
@@ -79,36 +80,20 @@ Orbit *orbit_new(double cx, double cy, int max_iter, double max_delta)
     o->len = n; /* orbit has Z[0..n-1]; Z[n] would be escaped or == Z_{max} */
 
     /* ── SA coefficients ── */
-    /* A_{n+1} = 2*Z_n*A_n + 1,  B_{n+1} = 2*Z_n*B_n + A_n^2 */
+    /* A_{n+1} = 2*Z_n*A_n + 1,  B_{n+1} = 2*Z_n*B_n + A_n^2
+     * Stored at every k (cheap, independent of zoom level) so that
+     * orbit_select() can later pick sa_skip for any max_delta without
+     * recomputing this recurrence.                                    */
     cx_t An = { 0.0, 0.0 };
     cx_t Bn = { 0.0, 0.0 };
     cx_t Cn = { 0.0, 0.0 };
-    o->sa_skip = 0;
-
-    double md2 = max_delta * max_delta;
 
     for (int k = 0; k < o->len; k++) {
         o->sA[k] = An;
         o->sB[k] = Bn;
+        o->sC[k] = Cn;
 
         cx_t two_Zk = cx_scale(o->Z[k], 2.0);
-
-        /* Validity requires the truncated quadratic AND cubic terms to be
-         * negligible next to the retained linear term:
-         *   |B_k| * max_delta     < tol * |A_k|   (quadratic term tiny)
-         *   |C_k| * max_delta^2   < tol * |A_k|   (cubic term tiny)
-         * Checking only the cubic term (as a single coefficient ratio) is
-         * not sufficient: C_k can be coincidentally ~0 early on (e.g. an
-         * artifact of Z_0=0) while B_k*Δc is still comparable to A_k*Δc,
-         * meaning the series has NOT actually converged — this produced
-         * widespread wrong iteration counts at low zoom (large Δc) where
-         * the 2-term truncation is simply invalid.                       */
-        double absB = sqrt(cx_abs2(Bn));
-        double absC = sqrt(cx_abs2(Cn));
-        double absA = sqrt(cx_abs2(An));
-        if (absB * max_delta < 1e-3 * absA && absC * md2 < 1e-3 * absA) {
-            o->sa_skip = k;
-        }
 
         /* recurrence */
         cx_t An1 = cx_add(cx_mul(two_Zk, An), (cx_t){1.0, 0.0});
@@ -119,15 +104,9 @@ Orbit *orbit_new(double cx, double cy, int max_iter, double max_delta)
         Bn = Bn1;
         Cn = Cn1;
     }
-    /* store A,B at sa_skip */
-    if (o->len > 0 && o->sa_skip < o->len) {
-        o->sa_A = o->sA[o->sa_skip];
-        o->sa_B = o->sB[o->sa_skip];
-    } else {
-        o->sa_A = (cx_t){0.0, 0.0};
-        o->sa_B = (cx_t){0.0, 0.0};
-        o->sa_skip = 0;
-    }
+    o->sa_skip = 0;
+    o->sa_A = (cx_t){0.0, 0.0};
+    o->sa_B = (cx_t){0.0, 0.0};
 
     /* ── BLA table ── */
     /* Level 0: step = 1.  For position n:
@@ -190,12 +169,41 @@ Orbit *orbit_new(double cx, double cy, int max_iter, double max_delta)
     return o;
 }
 
+void orbit_select(Orbit *o, double max_delta)
+{
+    if (!o || o->len == 0) return;
+
+    /* Validity requires the truncated quadratic AND cubic terms to be
+     * negligible next to the retained linear term:
+     *   |B_k| * max_delta     < tol * |A_k|   (quadratic term tiny)
+     *   |C_k| * max_delta^2   < tol * |A_k|   (cubic term tiny)
+     * Checking only the cubic term (as a single coefficient ratio) is
+     * not sufficient: C_k can be coincidentally ~0 early on (e.g. an
+     * artifact of Z_0=0) while B_k*Δc is still comparable to A_k*Δc,
+     * meaning the series has NOT actually converged — this produced
+     * widespread wrong iteration counts at low zoom (large Δc) where
+     * the 2-term truncation is simply invalid.                       */
+    double md2 = max_delta * max_delta;
+    int sa_skip = 0;
+    for (int k = 0; k < o->len; k++) {
+        double absA = sqrt(cx_abs2(o->sA[k]));
+        double absB = sqrt(cx_abs2(o->sB[k]));
+        double absC = sqrt(cx_abs2(o->sC[k]));
+        if (absB * max_delta < 1e-3 * absA && absC * md2 < 1e-3 * absA)
+            sa_skip = k;
+    }
+    o->sa_skip = sa_skip;
+    o->sa_A    = o->sA[sa_skip];
+    o->sa_B    = o->sB[sa_skip];
+}
+
 void orbit_free(Orbit *o)
 {
     if (!o) return;
     free(o->Z);
     free(o->sA);
     free(o->sB);
+    free(o->sC);
     for (int j = 0; j < BLA_LEVELS; j++) free(o->bla[j]);
     free(o);
 }

@@ -3,6 +3,7 @@
  *  wasd    pan              z / x   zoom in / out
  *  i / o   more/fewer iter  k / l   color density up / down
  *  p       save PNG         t       toggle truecolor / 16-color
+ *  M       zoom-out animation (prompts for per-frame zoom factor)
  *  q       quit
  *
  *  Rendering uses Unicode upper-half-block glyphs (▀) with independent
@@ -18,6 +19,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <math.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -106,6 +108,30 @@ static void view_geometry(int *Wp, int *hp, int *php,
 
     *Wp = W; *hp = h; *php = ph;
     *sxp = sx; *syp = sy; *x0p = x0; *y0p = y0;
+}
+
+/* ─── cached reference orbit ─────────────────────────────────────────────
+ * The reference orbit, SA arrays, and BLA pyramid depend only on (cx, cy,
+ * max_iter) — not on zoom — so a pure zoom animation (the common case)
+ * can reuse the same orbit across every frame and pay only the cheap
+ * orbit_select() rescan, instead of rebuilding the whole BLA pyramid from
+ * scratch on every single frame.                                          */
+
+static Orbit *g_orbit     = NULL;
+static double g_orbit_cx  = 0.0/0.0;
+static double g_orbit_cy  = 0.0/0.0;
+static int    g_orbit_iter = -1;
+
+static Orbit *get_orbit(double cx, double cy, int mi, double max_delta) {
+    if (!g_orbit || cx != g_orbit_cx || cy != g_orbit_cy || mi != g_orbit_iter) {
+        orbit_free(g_orbit);
+        g_orbit     = orbit_new(cx, cy, mi);
+        g_orbit_cx  = cx;
+        g_orbit_cy  = cy;
+        g_orbit_iter = mi;
+    }
+    if (g_orbit) orbit_select(g_orbit, max_delta);
+    return g_orbit;
 }
 
 /* ─── scalar fallback Mandelbrot (used only if orbit allocation fails) ──── */
@@ -218,7 +244,7 @@ static void render(void) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    Orbit *orb = orbit_new(g_cx, g_cy, mi, max_delta);
+    Orbit *orb = get_orbit(g_cx, g_cy, mi, max_delta);
     int sa_skip  = orb ? orb->sa_skip    : 0;
     int bla_levs = orb ? orb->bla_levels : 0;
 
@@ -290,8 +316,6 @@ static void render(void) {
         free(dcr); free(dci_top); free(dci_bot); free(irow_top); free(irow_bot);
     }
 
-    orbit_free(orb);
-
     clock_gettime(CLOCK_MONOTONIC, &t1);
     g_render_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
 
@@ -315,7 +339,7 @@ static void render(void) {
         "  render=%.1fms"
         "  color=%s"
         "%s%s"
-        "  \033[2m[wasd]move [z/x]zoom [i/o]iter [k/l]color [p]png [t]color-mode [q]quit\033[0m",
+        "  \033[2m[wasd]move [z/x]zoom [i/o]iter [k/l]color [p]png [t]color-mode [M]anim [q]quit\033[0m",
         h+1, g_cx, g_cy, g_zoom, g_iter,
         sa_skip, bla_levs, g_render_ms,
         g_truecolor ? "truecolor" : "16-color",
@@ -350,10 +374,10 @@ static void save_png(void) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    Orbit *orb = orbit_new(g_cx, g_cy, mi, max_delta);
+    Orbit *orb = get_orbit(g_cx, g_cy, mi, max_delta);
 
     unsigned char *rgb = malloc((size_t)pw * phh * 3);
-    if (!rgb) { orbit_free(orb); snprintf(g_msg, sizeof g_msg, "png save failed: out of memory"); return; }
+    if (!rgb) { snprintf(g_msg, sizeof g_msg, "png save failed: out of memory"); return; }
 
     #pragma omp parallel for schedule(dynamic, 2)
     for (int y = 0; y < phh; y++) {
@@ -385,8 +409,6 @@ static void save_png(void) {
         free(dcr); free(dci); free(irow);
     }
 
-    orbit_free(orb);
-
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
 
@@ -407,6 +429,73 @@ static void save_png(void) {
         snprintf(g_msg, sizeof g_msg, "saved %s (%dx%d, %.0fms)", fname, pw, phh, ms);
     else
         snprintf(g_msg, sizeof g_msg, "png save failed: %s", fname);
+}
+
+/* ─── zoom-out animation ─────────────────────────────────────────────────
+ * 'M' plays a live zoom-out animation from the current zoom level down to
+ * 1.0 ("e0"), dividing g_zoom by a user-chosen per-frame factor each step
+ * (e.g. 1.085 for a slow, smooth descent). Since the center (cx, cy) and
+ * iteration count stay fixed throughout, every frame hits the orbit cache
+ * in get_orbit() — only the cheap orbit_select() rescan runs per frame,
+ * not a full reference-orbit/BLA rebuild.                                 */
+
+static void draw_status_line(const char *text) {
+    int W, H;
+    term_size(&W, &H);
+    char buf[600];
+    int n = snprintf(buf, sizeof buf, "\033[%d;1H\033[K  %s", H, text);
+    if (n > 0) (void)write(STDOUT_FILENO, buf, n);
+}
+
+/* Reads digits/'.' for a per-frame zoom-out factor (> 1.0). Returns 1
+ * with *out set on Enter, 0 (no change) if cancelled with Esc.           */
+static int prompt_zoom_factor(double *out) {
+    char buf[32] = "";
+    int  len = 0;
+    for (;;) {
+        char line[96];
+        snprintf(line, sizeof line,
+            "zoom-out factor per frame, e.g. 1.085 (Enter=go, Esc=cancel): %s", buf);
+        draw_status_line(line);
+
+        char c;
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n <= 0) return 0;
+
+        if (c == '\r' || c == '\n') {
+            double f = atof(buf);
+            if (f > 1.0) { *out = f; return 1; }
+            continue; /* empty/invalid entry: keep prompting */
+        }
+        if (c == 27) return 0;
+        if ((c == 127 || c == 8) && len > 0) { buf[--len] = '\0'; continue; }
+        if ((c == '.' || (c >= '0' && c <= '9')) && len < (int)sizeof(buf) - 1) {
+            buf[len++] = c; buf[len] = '\0';
+        }
+    }
+}
+
+/* Any keypress aborts the animation; 'q'/'Q' also requests a full quit. */
+static void play_zoom_out(double factor, int *quit) {
+    *quit = 0;
+    int aborted = 0;
+    while (g_zoom > 1.0) {
+        g_zoom /= factor;
+        if (g_zoom < 1.0) g_zoom = 1.0;
+        render();
+
+        struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
+        if (poll(&pfd, 1, 0) > 0) {
+            char c;
+            if (read(STDIN_FILENO, &c, 1) == 1) {
+                if (c == 'q' || c == 'Q') *quit = 1;
+                aborted = 1;
+                break;
+            }
+        }
+    }
+    snprintf(g_msg, sizeof g_msg, *quit ? "animation interrupted" :
+             aborted ? "animation aborted" : "animation complete (zoom=1)");
 }
 
 /* ─── main ──────────────────────────────────────────────────────────────── */
@@ -459,6 +548,21 @@ int main(void) {
         case 'p': case 'P': save_png(); break;
 
         case 't': case 'T': g_truecolor = !g_truecolor; break;
+
+        case 'm': case 'M':
+            if (g_zoom <= 1.0) {
+                snprintf(g_msg, sizeof g_msg, "already at base zoom (1.0)");
+            } else {
+                double factor;
+                if (prompt_zoom_factor(&factor)) {
+                    int quit_req = 0;
+                    play_zoom_out(factor, &quit_req);
+                    if (quit_req) goto quit;
+                } else {
+                    g_msg[0] = '\0';
+                }
+            }
+            break;
 
         default: dirty = 0; break;
         }
