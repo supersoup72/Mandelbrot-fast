@@ -30,6 +30,11 @@ static inline cx_t cx_scale(cx_t a, double s) {
  * longer trustworthy and the pixel orbit may have drifted onto the wrong
  * branch. Flagged pixels are recomputed directly (see scalar_mandelbrot_mp). */
 #define GLITCH_EPS2 1e-12   /* (1e-6)^2 */
+#define DELTA_GROWTH_FRAC 1e-2  /* δ grown to >1% of |Z_n|^2: perturbation's
+                                 * small-delta accuracy assumption has broken
+                                 * down, regardless of whether W passed near
+                                 * zero -- force the MPFR fallback instead of
+                                 * trusting a now-meaningless double δ.      */
 
 /* Below this many elements, OpenMP's thread spawn/join overhead exceeds
  * the work being parallelized — measured break-even is ~20k elements for
@@ -402,9 +407,10 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
             double Wr = Znr + dr[x];
             double Wi = Zni + di[x];
             double W2 = Wr*Wr + Wi*Wi;
+            double d2 = dr[x]*dr[x] + di[x]*di[x];
             if (W2 > 4.0) {
                 iter_count[x] = sa_n;
-            } else if (W2 < GLITCH_EPS2 * Zmag2) {
+            } else if (W2 < GLITCH_EPS2 * Zmag2 || d2 > DELTA_GROWTH_FRAC * Zmag2) {
                 glitched[x]   = 1;
                 iter_count[x] = max_iter; /* placeholder; overridden later */
             }
@@ -494,9 +500,10 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
             double Wr = Znr + dr[x];
             double Wi = Zni + di[x];
             double W2 = Wr*Wr + Wi*Wi;
+            double d2 = dr[x]*dr[x] + di[x]*di[x];
             if (W2 > 4.0) {
                 iter_count[x] = n;
-            } else if (W2 < GLITCH_EPS2 * Zmag2) {
+            } else if (W2 < GLITCH_EPS2 * Zmag2 || d2 > DELTA_GROWTH_FRAC * Zmag2) {
                 glitched[x]   = 1;
                 iter_count[x] = max_iter;  /* placeholder; overridden later */
             }
@@ -587,11 +594,19 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
             int     esc_bits = _mm256_movemask_pd(esc_mask);
 
             /* glitch_mask: W anomalously small vs reference scale (catastrophic
-             * cancellation) AND did not escape this step                       */
+             * cancellation), OR δ itself has grown to a non-negligible
+             * fraction of |Z_n| (the small-perturbation assumption that
+             * perturbation theory's accuracy relies on has broken down) --
+             * AND did not escape this step                                    */
             double  Zmag2_next = Zr1*Zr1 + Zi1*Zi1;
             __m256d gthresh    = _mm256_set1_pd(GLITCH_EPS2 * Zmag2_next);
             __m256d raw_glitch = _mm256_cmp_pd(W2, gthresh, _CMP_LT_OQ);
-            __m256d glitch_mask = _mm256_andnot_pd(esc_mask, raw_glitch);
+            __m256d d2v        = _mm256_add_pd(_mm256_mul_pd(new_dr, new_dr),
+                                                _mm256_mul_pd(new_di, new_di));
+            __m256d gdthresh   = _mm256_set1_pd(DELTA_GROWTH_FRAC * Zmag2_next);
+            __m256d raw_dgrow  = _mm256_cmp_pd(d2v, gdthresh, _CMP_GT_OQ);
+            __m256d glitch_mask = _mm256_andnot_pd(esc_mask,
+                                       _mm256_or_pd(raw_glitch, raw_dgrow));
             int     glitch_bits = _mm256_movemask_pd(glitch_mask);
 
             /* Freeze escaped lanes: keep old delta */
@@ -658,7 +673,8 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
             double W2 = Wr*Wr + Wi*Wi;
             if (W2 > 4.0) { nn++; break; }
             double Zmag2 = Zr1*Zr1 + Zi1*Zi1;
-            if (W2 < GLITCH_EPS2 * Zmag2) { glitch = 1; break; }
+            double d2 = pdr*pdr + pdi*pdi;
+            if (W2 < GLITCH_EPS2 * Zmag2 || d2 > DELTA_GROWTH_FRAC * Zmag2) { glitch = 1; break; }
         }
         if (glitch) {
             glitched[x]   = 1;
