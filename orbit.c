@@ -325,13 +325,39 @@ void orbit_render_row(const Orbit *o, const double *dcr, const double *dci,
         double    Ar = be->A.r, Ai = be->A.i;
         double    Br = be->B.r, Bi = be->B.i;
 
-        for (int x = 0; x < w; x++) {
-            if (iter_count[x] >= 0) continue;
-            double old_dr = dr[x], old_di = di[x];
-            double Dcr_x = dcr[x],  Dci_x = dci[x];
-            /* δ_new = A*δ + B*Δc */
-            dr[x] = Ar*old_dr - Ai*old_di + Br*Dcr_x - Bi*Dci_x;
-            di[x] = Ar*old_di + Ai*old_dr + Br*Dci_x + Bi*Dcr_x;
+        /* δ_new = A*δ + B*Δc, applied SIMD-wide to the whole row (à la
+         * fraktaler-3's batched BLA application) rather than branching
+         * per pixel on iter_count. Already-resolved lanes get garbage
+         * values here, but nothing downstream ever reads dr/di for a
+         * pixel once iter_count[x] >= 0, so this is safe and lets the
+         * compiler/AVX2 process 4 lanes per step unconditionally.       */
+        __m256d vAr = _mm256_set1_pd(Ar), vAi = _mm256_set1_pd(Ai);
+        __m256d vBr = _mm256_set1_pd(Br), vBi = _mm256_set1_pd(Bi);
+        int xx = 0;
+        for (; xx + 4 <= w; xx += 4) {
+            __m256d old_dr = _mm256_loadu_pd(&dr[xx]);
+            __m256d old_di = _mm256_loadu_pd(&di[xx]);
+            __m256d Dcr_v  = _mm256_loadu_pd(&dcr[xx]);
+            __m256d Dci_v  = _mm256_loadu_pd(&dci[xx]);
+
+            __m256d new_dr = _mm256_add_pd(
+                                _mm256_sub_pd(_mm256_mul_pd(vAr, old_dr),
+                                              _mm256_mul_pd(vAi, old_di)),
+                                _mm256_sub_pd(_mm256_mul_pd(vBr, Dcr_v),
+                                              _mm256_mul_pd(vBi, Dci_v)));
+            __m256d new_di = _mm256_add_pd(
+                                _mm256_add_pd(_mm256_mul_pd(vAr, old_di),
+                                              _mm256_mul_pd(vAi, old_dr)),
+                                _mm256_add_pd(_mm256_mul_pd(vBr, Dci_v),
+                                              _mm256_mul_pd(vBi, Dcr_v)));
+            _mm256_storeu_pd(&dr[xx], new_dr);
+            _mm256_storeu_pd(&di[xx], new_di);
+        }
+        for (; xx < w; xx++) {
+            double old_dr = dr[xx], old_di = di[xx];
+            double Dcr_x = dcr[xx],  Dci_x = dci[xx];
+            dr[xx] = Ar*old_dr - Ai*old_di + Br*Dcr_x - Bi*Dci_x;
+            di[xx] = Ar*old_di + Ai*old_dr + Br*Dci_x + Bi*Dcr_x;
         }
         n += step;
 

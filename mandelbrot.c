@@ -2,11 +2,15 @@
  *
  *  wasd    pan              z / x   zoom in / out
  *  i / o   more/fewer iter  k / l   color density up / down
- *  q       quit
+ *  p       save PNG         q       quit
+ *
+ *  Rendering uses Unicode upper-half-block glyphs (▀) with independent
+ *  24-bit foreground/background colors, packing two vertical pixels per
+ *  terminal cell for roughly double the effective resolution.
  *
  *  Build:
  *    gcc -O3 -march=native -funroll-loops -ffast-math -fopenmp -mavx2 -mfma \
- *        -o mandelbrot mandelbrot.c orbit.c -lm -fopenmp
+ *        -o mandelbrot mandelbrot.c orbit.c png_writer.c -lm -lz -fopenmp
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -17,8 +21,10 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #include "orbit.h"
+#include "png_writer.h"
 
 /* ─── terminal ──────────────────────────────────────────────────────────── */
 
@@ -66,44 +72,77 @@ static double g_cy   =  0.0;
 static double g_zoom =  1.0;
 static int    g_iter =  128;
 static double g_dens =  8.0;
+static double g_render_ms = 0.0;
+static char   g_msg[160] = "";
 
-/* ─── 256-colour palette (6×6×6 cube, indices 16–231) ──────────────────── */
+/* ─── view geometry ──────────────────────────────────────────────────────
+ * Coordinates are sampled on a grid of square "sub-pixels": W columns by
+ * ph = 2*h sub-rows, two sub-rows packed per terminal row via half-block
+ * glyphs (one as foreground color, one as background). Because a terminal
+ * cell is about twice as tall as wide, splitting its height in two makes
+ * each sub-pixel roughly square, so a single step size sx == sy applies to
+ * both axes — no separate aspect-ratio correction needed.                 */
 
-typedef struct { char s[12]; int n; } ColEsc;
-static ColEsc g_pal[216];
+static void view_geometry(int *Wp, int *hp, int *php,
+                           double *sxp, double *syp, double *x0p, double *y0p) {
+    int W, H;
+    term_size(&W, &H);
+    int h = H - 1;
+    if (h < 1) h = 1;
+    if (W < 1) W = 1;
+    int ph = 2 * h;
 
-static void build_palette(void) {
-    for (int i = 0; i < 216; i++)
-        g_pal[i].n = snprintf(g_pal[i].s, 12, "\033[38;5;%dm", 16 + i);
+    double sx = 1.25 / g_zoom / h;
+    double sy = sx;
+    double x0 = g_cx - W  * 0.5 * sx;
+    double y0 = g_cy - ph * 0.5 * sy;
+
+    *Wp = W; *hp = h; *php = ph;
+    *sxp = sx; *syp = sy; *x0p = x0; *y0p = y0;
 }
 
-/* ─── per-iteration lookup table ────────────────────────────────────────── */
+/* ─── scalar fallback Mandelbrot (used only if orbit allocation fails) ──── */
 
-typedef struct { int pi; char ch; } IterEntry;
-static IterEntry *g_tab    = NULL;
-static int        g_tabcap = 0;
+static int scalar_fallback(double cr, double ci, int max_iter) {
+    double p = cr - 0.25;
+    double q = p*p + ci*ci;
+    if (q*(q+p) <= 0.25*ci*ci || (cr+1.0)*(cr+1.0) + ci*ci <= 0.0625)
+        return max_iter;
+    double zr=0, zi=0, zr2=0, zi2=0;
+    int it=0;
+    while (zr2+zi2 < 4.0 && it < max_iter) {
+        zi  = 2.0*zr*zi + ci;
+        zr  = zr2-zi2 + cr;
+        zr2 = zr*zr; zi2 = zi*zi;
+        it++;
+    }
+    return it;
+}
 
-static const char GLYPHS[] = " .:!|=+*#%@";
-#define NG ((int)(sizeof(GLYPHS) - 1))
+/* ─── continuous truecolor iteration→RGB table ──────────────────────────── */
+
+typedef struct { unsigned char r, g, b; } RGB;
+static RGB *g_tab    = NULL;
+static int  g_tabcap = 0;
 
 static void build_itable(void) {
-    int need = g_iter + 2;
+    int need = g_iter + 1;
     if (g_tabcap < need) {
         free(g_tab);
         g_tab    = malloc(need * sizeof *g_tab);
         g_tabcap = need;
     }
-    g_tab[g_iter].pi = -1;
-    g_tab[g_iter].ch = ' ';
+    g_tab[g_iter].r = g_tab[g_iter].g = g_tab[g_iter].b = 0; /* inside set: black */
 
     for (int i = 0; i < g_iter; i++) {
         double t = fmod((double)i / g_iter * g_dens, 1.0);
         double a = t * 6.283185307179586;
-        int r = (int)(sin(a)            * 2.5 + 2.5); if (r<0)r=0; if (r>5)r=5;
-        int g = (int)(sin(a + 2.094395) * 2.5 + 2.5); if (g<0)g=0; if (g>5)g=5;
-        int b = (int)(sin(a + 4.188790) * 2.5 + 2.5); if (b<0)b=0; if (b>5)b=5;
-        g_tab[i].pi = 36*r + 6*g + b;
-        g_tab[i].ch = GLYPHS[(int)(t * NG) % NG];
+        double r = (sin(a)               + 1.0) * 0.5;
+        double g = (sin(a + 2.094395102) + 1.0) * 0.5;
+        double b = (sin(a + 4.188790205) + 1.0) * 0.5;
+        g_tab[i].r = (unsigned char)(r * 255.0 + 0.5);
+        g_tab[i].g = (unsigned char)(g * 255.0 + 0.5);
+        g_tab[i].b = (unsigned char)(b * 255.0 + 0.5);
     }
 }
 
@@ -115,7 +154,10 @@ static int    g_rcap  = 0;
 static char  *g_frame = NULL;
 static int    g_fcap  = 0;
 
-#define PX_MAX 13   /* max bytes per pixel: 11 (esc) + 1 (char) + spare */
+/* worst case per cell: fg + bg 24-bit SGR codes ("\033[38;2;255;255;255m"
+ * is 19 bytes, same for bg) plus the 3-byte UTF-8 "▀" glyph.              */
+#define PX_MAX 64
+#define STATUS_RESERVE 1024
 
 static void ensure_bufs(int w, int h) {
     if (h > g_rcap) {
@@ -126,118 +168,93 @@ static void ensure_bufs(int w, int h) {
     }
     int rw = w * PX_MAX + 4;
     for (int i = 0; i < h; i++) g_rows[i] = realloc(g_rows[i], rw);
-    int fw = h * rw + 512;
+    int fw = h * rw + STATUS_RESERVE;
     if (fw > g_fcap) { free(g_frame); g_frame = malloc(fw); g_fcap = fw; }
 }
-
-static const char BLK[]  = "\033[38;5;232m";
-#define BLK_N 11
 
 /* ─── render ────────────────────────────────────────────────────────────── */
 
 static void render(void) {
-    int W, H;
-    term_size(&W, &H);
-    int h = H - 1;           /* reserve last row for status bar */
-    if (h < 1 || W < 1) return;
+    int W, h, ph;
+    double sx, sy, x0, y0;
+    view_geometry(&W, &h, &ph, &sx, &sy, &x0, &y0);
     ensure_bufs(W, h);
 
-    /* coordinate step sizes (terminal cells are ~2x taller than wide,
-     * so a column must cover half the coordinate distance a row does) */
-    double sy = 2.5 / g_zoom / h;
-    double sx = sy * 0.5;
-    double x0 = g_cx - W * 0.5 * sx;
-    double y0 = g_cy - h * 0.5 * sy;
-
-    /* max_delta: half-diagonal of the view in coordinate space.
-     * This is used by the SA validity criterion.                  */
-    double max_delta = sqrt((sx * W) * (sx * W) + (sy * h) * (sy * h)) * 0.5;
+    double half_w = sx * W  * 0.5;
+    double half_h = sy * ph * 0.5;
+    double max_delta = sqrt(half_w*half_w + half_h*half_h);
 
     int mi = g_iter;
 
-    /* Build reference orbit at view center */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
     Orbit *orb = orbit_new(g_cx, g_cy, mi, max_delta);
-
-    int sa_skip   = orb ? orb->sa_skip   : 0;
-    int bla_levs  = orb ? orb->bla_levels: 0;
-
-    /* Per-row iteration buffer — allocate once, reused per thread */
-    /* Each thread needs its own scratch; use thread-private or alloc per row */
+    int sa_skip  = orb ? orb->sa_skip    : 0;
+    int bla_levs = orb ? orb->bla_levels : 0;
 
     #pragma omp parallel for schedule(dynamic, 2)
     for (int y = 0; y < h; y++) {
-        char *rb  = g_rows[y];
-        int   rp  = 0;
-        int   ppi = -2;
-        double ci = y0 + y * sy;
+        char *rb = g_rows[y];
+        int   rp = 0;
+        RGB   prev_fg = {0,0,0}, prev_bg = {0,0,0};
+        int   have_fg = 0, have_bg = 0;
 
-        /* Build Δc arrays for this row */
-        double *dcr = malloc(W * sizeof(double));
-        double *dci = malloc(W * sizeof(double));
-        int    *irow= malloc(W * sizeof(int));
+        double ci_top = y0 + (2*y)     * sy;
+        double ci_bot = y0 + (2*y + 1) * sy;
 
-        if (!dcr || !dci || !irow) {
-            free(dcr); free(dci); free(irow);
+        double *dcr     = malloc(W * sizeof(double));
+        double *dci_top = malloc(W * sizeof(double));
+        double *dci_bot = malloc(W * sizeof(double));
+        int    *irow_top= malloc(W * sizeof(int));
+        int    *irow_bot= malloc(W * sizeof(int));
+
+        if (!dcr || !dci_top || !dci_bot || !irow_top || !irow_bot) {
+            free(dcr); free(dci_top); free(dci_bot); free(irow_top); free(irow_bot);
             g_rlens[y] = 0;
             continue;
         }
 
         for (int x = 0; x < W; x++) {
-            dcr[x] = x0 + x * sx - g_cx;
-            dci[x] = ci - g_cy;
+            dcr[x]     = x0 + x * sx - g_cx;
+            dci_top[x] = ci_top - g_cy;
+            dci_bot[x] = ci_bot - g_cy;
         }
 
         if (orb) {
-            orbit_render_row(orb, dcr, dci, W, mi, irow);
+            orbit_render_row(orb, dcr, dci_top, W, mi, irow_top);
+            orbit_render_row(orb, dcr, dci_bot, W, mi, irow_bot);
         } else {
-            /* orbit allocation failed: scalar fallback */
             for (int x = 0; x < W; x++) {
-                double cr = g_cx + dcr[x];
-                double cci= g_cy + dci[x];
-                double p  = cr - 0.25;
-                double q  = p*p + cci*cci;
-                if (q * (q + p) <= 0.25 * cci*cci ||
-                    (cr+1.0)*(cr+1.0) + cci*cci <= 0.0625) {
-                    irow[x] = mi;
-                } else {
-                    double zr=0,zi=0,zr2=0,zi2=0;
-                    int it=0;
-                    while (zr2+zi2 < 4.0 && it < mi) {
-                        zi  = 2.0*zr*zi + cci;
-                        zr  = zr2-zi2 + cr;
-                        zr2 = zr*zr; zi2=zi*zi;
-                        it++;
-                    }
-                    irow[x] = it;
-                }
+                irow_top[x] = scalar_fallback(g_cx + dcr[x], g_cy + dci_top[x], mi);
+                irow_bot[x] = scalar_fallback(g_cx + dcr[x], g_cy + dci_bot[x], mi);
             }
         }
 
-        /* Encode row into escape sequences */
         for (int x = 0; x < W; x++) {
-            int iter = irow[x];
-            IterEntry *e = &g_tab[iter < mi ? iter : mi];
+            RGB fg = g_tab[irow_top[x] < mi ? irow_top[x] : mi];
+            RGB bg = g_tab[irow_bot[x] < mi ? irow_bot[x] : mi];
 
-            if (e->pi != ppi) {
-                if (e->pi < 0) {
-                    memcpy(rb+rp, BLK, BLK_N); rp += BLK_N;
-                } else {
-                    ColEsc *ce = &g_pal[e->pi];
-                    memcpy(rb+rp, ce->s, ce->n); rp += ce->n;
-                }
-                ppi = e->pi;
+            if (!have_fg || fg.r!=prev_fg.r || fg.g!=prev_fg.g || fg.b!=prev_fg.b) {
+                rp += snprintf(rb+rp, 20, "\033[38;2;%d;%d;%dm", fg.r, fg.g, fg.b);
+                prev_fg = fg; have_fg = 1;
             }
-            rb[rp++] = e->ch;
+            if (!have_bg || bg.r!=prev_bg.r || bg.g!=prev_bg.g || bg.b!=prev_bg.b) {
+                rp += snprintf(rb+rp, 20, "\033[48;2;%d;%d;%dm", bg.r, bg.g, bg.b);
+                prev_bg = bg; have_bg = 1;
+            }
+            rb[rp++] = '\xe2'; rb[rp++] = '\x96'; rb[rp++] = '\x80'; /* ▀ */
         }
         rb[rp++] = '\n';
         g_rlens[y] = rp;
 
-        free(dcr);
-        free(dci);
-        free(irow);
+        free(dcr); free(dci_top); free(dci_bot); free(irow_top); free(irow_bot);
     }
 
     orbit_free(orb);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    g_render_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
 
     /* Assemble frame and single write() */
     int fp = 0;
@@ -248,27 +265,106 @@ static void render(void) {
         fp += g_rlens[y];
     }
 
-    /* Status bar with SA and BLA debug info */
-    fp += snprintf(g_frame+fp, 512,
+    /* Status bar with SA/BLA debug info, render time, and last message */
+    fp += snprintf(g_frame+fp, STATUS_RESERVE,
         "\033[0m\033[%d;1H\033[K"
         "  \033[1mcx\033[0m=%-14.8g"
         "  \033[1mcy\033[0m=%-14.8g"
         "  \033[1mzoom\033[0m=%-11.5g"
         "  \033[1miter\033[0m=%-4d"
-        "  \033[1mdens\033[0m=%.2f"
-        "  SA skip=%-4d BLA levels=%-2d"
-        "  \033[2m[wasd]move [z/x]zoom [i/o]iter [k/l]color [q]quit\033[0m",
-        H, g_cx, g_cy, g_zoom, g_iter, g_dens,
-        sa_skip, bla_levs);
+        "  SA=%-4d BLA=%-2d"
+        "  render=%.1fms"
+        "%s%s"
+        "  \033[2m[wasd]move [z/x]zoom [i/o]iter [k/l]color [p]png [q]quit\033[0m",
+        h+1, g_cx, g_cy, g_zoom, g_iter,
+        sa_skip, bla_levs, g_render_ms,
+        g_msg[0] ? "  " : "", g_msg);
 
     (void)write(STDOUT_FILENO, g_frame, fp);
     g_resize = 0;
 }
 
+/* ─── PNG export ────────────────────────────────────────────────────────── */
+
+static void save_png(void) {
+    int W, h, ph;
+    double sx, sy, x0, y0;
+    view_geometry(&W, &h, &ph, &sx, &sy, &x0, &y0);
+
+    /* Oversample the same view bounds onto a higher-resolution grid
+     * (target ~1920 px wide) rather than just upscaling terminal cells. */
+    int scale = 1920 / W;
+    if (scale < 1) scale = 1;
+    int pw  = W  * scale;
+    int phh = ph * scale;
+    double psx = sx / scale;
+    double psy = sy / scale;
+
+    double half_w = psx * pw  * 0.5;
+    double half_h = psy * phh * 0.5;
+    double max_delta = sqrt(half_w*half_w + half_h*half_h);
+
+    int mi = g_iter;
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    Orbit *orb = orbit_new(g_cx, g_cy, mi, max_delta);
+
+    unsigned char *rgb = malloc((size_t)pw * phh * 3);
+    if (!rgb) { orbit_free(orb); snprintf(g_msg, sizeof g_msg, "png save failed: out of memory"); return; }
+
+    #pragma omp parallel for schedule(dynamic, 2)
+    for (int y = 0; y < phh; y++) {
+        double ci = y0 + y * psy - g_cy;
+
+        double *dcr = malloc(pw * sizeof(double));
+        double *dci = malloc(pw * sizeof(double));
+        int    *irow= malloc(pw * sizeof(int));
+        if (!dcr || !dci || !irow) { free(dcr); free(dci); free(irow); continue; }
+
+        for (int x = 0; x < pw; x++) {
+            dcr[x] = x0 + x * psx - g_cx;
+            dci[x] = ci;
+        }
+
+        if (orb) {
+            orbit_render_row(orb, dcr, dci, pw, mi, irow);
+        } else {
+            for (int x = 0; x < pw; x++)
+                irow[x] = scalar_fallback(g_cx + dcr[x], g_cy + dci[x], mi);
+        }
+
+        unsigned char *row = rgb + (size_t)y * pw * 3;
+        for (int x = 0; x < pw; x++) {
+            RGB c = g_tab[irow[x] < mi ? irow[x] : mi];
+            row[x*3+0] = c.r; row[x*3+1] = c.g; row[x*3+2] = c.b;
+        }
+
+        free(dcr); free(dci); free(irow);
+    }
+
+    orbit_free(orb);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+    time_t now = time(NULL);
+    char fname[64];
+    strftime(fname, sizeof fname, "mandelbrot_%Y%m%d_%H%M%S.png", localtime(&now));
+
+    int ok = write_png(fname, pw, phh, rgb) == 0;
+    free(rgb);
+
+    if (ok)
+        snprintf(g_msg, sizeof g_msg, "saved %s (%dx%d, %.0fms)", fname, pw, phh, ms);
+    else
+        snprintf(g_msg, sizeof g_msg, "png save failed: %s", fname);
+}
+
 /* ─── main ──────────────────────────────────────────────────────────────── */
 
 int main(void) {
-    build_palette();
     term_init();
     build_itable();
     render();
@@ -281,6 +377,8 @@ int main(void) {
             continue;
         }
         if (n == 0) break;
+
+        if (c != 'p' && c != 'P') g_msg[0] = '\0';
 
         int dirty = 1, need_iet = 0;
         double vs = 0.25 / g_zoom;
@@ -310,6 +408,8 @@ int main(void) {
 
         case 'k': case 'K': g_dens *= 1.5; need_iet = 1; break;
         case 'l': case 'L': g_dens /= 1.5; need_iet = 1; break;
+
+        case 'p': case 'P': save_png(); break;
 
         default: dirty = 0; break;
         }
