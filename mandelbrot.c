@@ -93,8 +93,16 @@ static int    g_truecolor = 1;
  * each sub-pixel roughly square, so a single step size sx == sy applies to
  * both axes — no separate aspect-ratio correction needed.                 */
 
+/* Deliberately does NOT return an absolute view origin (g_cx/g_cy - half
+ * extent): per-pixel deltas are derived purely from pixel index and step
+ * size (see render()/render_view_to_png()), never added to and subtracted
+ * back from the absolute center. That round-trip used to be exactly how
+ * dcr/dci were computed and it throws away precision for no reason — once
+ * sx is small relative to g_cx's own ULP, "g_cx - half_w" already rounds,
+ * and the subsequent "+ x*sx - g_cx" compounds it further. Avoiding the
+ * round-trip buys several extra usable bits of zoom depth for free.       */
 static void view_geometry(int *Wp, int *hp, int *php,
-                           double *sxp, double *syp, double *x0p, double *y0p) {
+                           double *sxp, double *syp) {
     int W, H;
     term_size(&W, &H);
     int h = H - 1;
@@ -104,11 +112,9 @@ static void view_geometry(int *Wp, int *hp, int *php,
 
     double sx = 1.25 / g_zoom / h;
     double sy = sx;
-    double x0 = g_cx - W  * 0.5 * sx;
-    double y0 = g_cy - ph * 0.5 * sy;
 
     *Wp = W; *hp = h; *php = ph;
-    *sxp = sx; *syp = sy; *x0p = x0; *y0p = y0;
+    *sxp = sx; *syp = sy;
 }
 
 /* ─── cached reference orbit ─────────────────────────────────────────────
@@ -232,8 +238,8 @@ static void ensure_bufs(int w, int h) {
 
 static void render(void) {
     int W, h, ph;
-    double sx, sy, x0, y0;
-    view_geometry(&W, &h, &ph, &sx, &sy, &x0, &y0);
+    double sx, sy;
+    view_geometry(&W, &h, &ph, &sx, &sy);
     ensure_bufs(W, h);
 
     double half_w = sx * W  * 0.5;
@@ -256,8 +262,8 @@ static void render(void) {
         RGB   prev_fg = {0,0,0}, prev_bg = {0,0,0};
         int   have_fg = 0, have_bg = 0;
 
-        double ci_top = y0 + (2*y)     * sy;
-        double ci_bot = y0 + (2*y + 1) * sy;
+        double ci_top = (2*y)     * sy - half_h;
+        double ci_bot = (2*y + 1) * sy - half_h;
 
         /* Per-thread scratch buffers, grown (never shrunk) and reused
          * across calls — render() can run thousands of times during a
@@ -281,9 +287,9 @@ static void render(void) {
         }
 
         for (int x = 0; x < W; x++) {
-            dcr[x]     = x0 + x * sx - g_cx;
-            dci_top[x] = ci_top - g_cy;
-            dci_bot[x] = ci_bot - g_cy;
+            dcr[x]     = x * sx - half_w;
+            dci_top[x] = ci_top;
+            dci_bot[x] = ci_bot;
         }
 
         if (orb) {
@@ -368,8 +374,8 @@ static void render(void) {
 static int render_view_to_png(const char *fname, int png_level,
                                int *pw_out, int *ph_out, double *ms_out) {
     int W, h, ph;
-    double sx, sy, x0, y0;
-    view_geometry(&W, &h, &ph, &sx, &sy, &x0, &y0);
+    double sx, sy;
+    view_geometry(&W, &h, &ph, &sx, &sy);
 
     int scale = 1920 / W;
     if (scale < 1) scale = 1;
@@ -394,7 +400,7 @@ static int render_view_to_png(const char *fname, int png_level,
 
     #pragma omp parallel for schedule(dynamic, 2)
     for (int y = 0; y < phh; y++) {
-        double ci = y0 + y * psy - g_cy;
+        double ci = y * psy - half_h;
 
         /* Per-thread scratch buffers, grown (never shrunk) and reused
          * across calls — an animation can call this hundreds of times,
@@ -412,7 +418,7 @@ static int render_view_to_png(const char *fname, int png_level,
         if (cap < pw) continue;
 
         for (int x = 0; x < pw; x++) {
-            dcr[x] = x0 + x * psx - g_cx;
+            dcr[x] = x * psx - half_w;
             dci[x] = ci;
         }
 
@@ -596,7 +602,12 @@ int main(void) {
         case 'd': case 'D': g_cx += hs; break;
 
         case 'z': case 'Z':
-            if (g_zoom < 1e14) g_zoom *= 1.5;
+            /* Per-pixel deltas are computed without ever round-tripping
+             * through the absolute center (see view_geometry()), so
+             * double precision holds up far past the old 1e14 cap that
+             * was masking that cancellation bug. 1e17 leaves headroom
+             * below where sx itself would underflow.                   */
+            if (g_zoom < 1e17) g_zoom *= 1.5;
             break;
         case 'x': case 'X':
             if (g_zoom > 1e-4) g_zoom /= 1.5;
